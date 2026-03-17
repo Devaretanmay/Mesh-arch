@@ -1,0 +1,53 @@
+# Mesh Ignore File
+# =================
+# This file tells Mesh which violations to ignore.
+# Lines starting with # are comments.
+#
+# Pattern Formats:
+# ----------------
+# 1. Exact match for specific violation:
+#    duplicate:validate_token
+#    naming:getUserData
+#    circular:module_a:module_b
+#
+# 2. Wildcard for all violations of a kind:
+#    naming:*
+#    duplicate:*
+#    circular:*
+#
+# 3. File-scoped ignore (all violations in a file):
+#    file:src/legacy/auth.py:*
+#    file:vendor/*:*
+#
+# 4. File-scoped with specific kind:
+#    file:legacy.py:naming:*
+#    file:old_code.py:duplicate:*
+#
+# Examples:
+# ---------
+
+# Example: Legacy file exempt from naming rules
+# Added: 2026-03-15 — Legacy code, will refactor later
+file:src/legacy/*:naming:*
+
+# Example: Known acceptable duplicate (different behaviour intentional)
+# Added: 2026-03-15 — validate_token in handler is intentionally different
+duplicate:validate_token:auth/new_handler.py
+
+# Example: Ignore all naming violations in test files
+file:tests/*:naming:*
+
+# Example: Ignore specific circular dependency (known architectural issue)
+# Added: 2026-03-15 — Will fix in next refactor
+circular:auth:utils
+
+# Example: Ignore all violations in generated code
+file:generated/*:*
+
+# Best Practices:
+# ---------------
+# 1. Always add a comment explaining WHY you're ignoring
+# 2. Include the date when the ignore was added
+# 3. Prefer file-scoped ignores over global wildcards
+# 4. Review and remove ignores when technical debt is paid
+# 5. Never ignore violations to make CI pass without discussion

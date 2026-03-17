@@ -1,0 +1,42 @@
+# Mesh ignore file
+# Directories and files that Mesh should never analyse
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+env/
+.env/
+site-packages/
+
+# Build output
+dist/
+build/
+__pycache__/
+.next/
+out/
+target/
+bin/
+obj/
+
+# Version control
+.git/
+.svn/
+
+# Generated
+generated/
+gen/
+proto/
+
+# IDE
+.idea/
+.vscode/
+
+# Lock files and minified
+*.lock
+*.min.js
+*.min.css
+*.map
+*.pyc
+*.pyo
