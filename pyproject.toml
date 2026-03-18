@@ -16,6 +16,8 @@ dependencies = [
     # Auth
     "requests>=2.31.0",
     "keyring>=25.0.0",
+    # Payments
+    "stripe>=7.0.0",
 ]
 
 [tool.setuptools.packages.find]
