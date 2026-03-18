@@ -80,23 +80,37 @@ def init(root):
 @click.option("--root", default=".", help="Codebase root directory")
 def status(root):
     """Show Mesh status and statistics."""
+    from mesh.auth.tier import get_detector
+
     codebase_root = Path(root).resolve()
     storage = MeshStorage(codebase_root)
-
-    if not storage.graphs_exist():
-        console.print("  Run 'mesh init' first")
-        storage.close()
-        return
-
-    node_count = storage.node_count()
-    edge_count = storage.edge_count()
+    detector = get_detector()
+    auth_info = detector.get_auth_info()
+    tier_info = detector.get_current_tier()
 
     console.print("")
     console.print("-" * 40)
     console.print("  Mesh Status")
     console.print("-" * 40)
-    console.print(f"  Nodes: {node_count}")
-    console.print(f"  Edges: {edge_count}")
+
+    if auth_info:
+        console.print(f"  Authenticated: {auth_info.login}")
+        console.print(f"  Tier: {tier_info.display_name}")
+        if auth_info.orgs_with_members:
+            console.print(f"  Organizations: {', '.join(auth_info.orgs_with_members)}")
+    else:
+        console.print("  Authenticated: No")
+        console.print("  Tier: Free")
+
+    if storage.graphs_exist():
+        node_count = storage.node_count()
+        edge_count = storage.edge_count()
+        console.print("")
+        console.print(f"  Graph nodes: {node_count}")
+        console.print(f"  Graph edges: {edge_count}")
+    else:
+        console.print("")
+        console.print("  Run 'mesh init' to analyze a codebase")
 
     storage.close()
 
@@ -188,11 +202,35 @@ def ask(question, root):
       mesh ask "what calls send_email?"
 
       mesh ask "how do the verification flows differ?"
+
+    Requires: Personal Pro or Organization Pro
     """
-    from rich.console import Console
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    allowed, reason = detector.is_pro_feature_allowed("ask")
+
+    if not allowed:
+        if reason.startswith("org_upgrade:"):
+            orgs = reason.split(":", 1)[1]
+            console.print("")
+            console.print(
+                f"  [yellow]You are using an organization account ({orgs}).[/yellow]"
+            )
+            console.print(
+                "  [yellow]Upgrade to Organization Pro to use this feature.[/yellow]"
+            )
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        else:
+            console.print("")
+            console.print("  [yellow]This feature requires Mesh Pro.[/yellow]")
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        return
+
     from mesh.ollama.explainer import explain_query
 
-    console = Console()
     root_path = Path(root).resolve()
 
     console.print(f"\n[dim]Analysing: {question}[/dim]")
@@ -338,6 +376,108 @@ def install_hook(root):
         console.print(f"  {result['message']}")
     else:
         console.print(f"  {result['message']}")
+
+
+@cli.command()
+@click.option("--token", help="GitHub Personal Access Token")
+def login(token):
+    """Authenticate with GitHub using a Personal Access Token.
+
+    Get a token from: https://github.com/settings/tokens
+    Required scope: read:user
+    """
+    from mesh.auth.tier import get_detector
+
+    if not token:
+        console.print("")
+        console.print("[yellow]Enter your GitHub Personal Access Token:[/yellow]")
+        console.print("[dim]Get one at: https://github.com/settings/tokens[/dim]")
+        console.print("[dim]Required scope: read:user[/dim]")
+        token = click.prompt("", type=str, hide_input=True)
+
+    if not token.startswith(("ghp_", "github_pat_")):
+        console.print("[red]Error: Token must start with 'ghp_' or 'github_pat_'[/red]")
+        return
+
+    console.print("")
+    console.print("  Authenticating with GitHub...")
+
+    detector = get_detector()
+    success, tier, message = detector.detect_and_save(token)
+
+    if success:
+        tier_info = detector.get_current_tier()
+        auth_info = detector.get_auth_info()
+        console.print("")
+        console.print(f"  [green]Success![/green] {message}")
+        console.print(f"  Tier: {tier_info.display_name}")
+        console.print("")
+        console.print("  Run 'mesh upgrade' to activate Pro features.")
+        if auth_info.orgs_with_members:
+            console.print(
+                f"  [dim]Orgs with >1 member: {', '.join(auth_info.orgs_with_members)}[/dim]"
+            )
+    else:
+        console.print(f"  [red]Failed: {message}[/red]")
+
+
+@cli.command()
+def logout():
+    """Clear stored GitHub authentication."""
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    detector.logout()
+
+    console.print("")
+    console.print("  [green]Logged out successfully[/green]")
+    console.print("  Authentication cleared.")
+
+
+@cli.command()
+def upgrade():
+    """Show pricing and upgrade options."""
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    auth_info = detector.get_auth_info()
+
+    console.print("")
+    console.print("-" * 40)
+    console.print("  Mesh Pro Upgrade")
+    console.print("-" * 40)
+    console.print("")
+
+    if not auth_info:
+        console.print("  [yellow]Please login first: mesh login[/yellow]")
+        return
+
+    if detector.is_org_user():
+        console.print(f"  Logged in as: {auth_info.login}")
+        console.print(f"  Organization(s): {', '.join(auth_info.orgs_with_members)}")
+        console.print("")
+        console.print("  [bold]Organization Pro[/bold]")
+        console.print("  $10/month per organization")
+        console.print("")
+        console.print("  Features:")
+        console.print("    - All Personal Pro features")
+        console.print("    - Team-wide analysis")
+        console.print("    - Organization dashboard")
+        console.print("    - Admin controls")
+        console.print("")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
+    else:
+        console.print(f"  Logged in as: {auth_info.login}")
+        console.print("")
+        console.print("  [bold]Personal Pro[/bold]")
+        console.print("  $5/month")
+        console.print("")
+        console.print("  Features:")
+        console.print("    - AI-powered codebase queries (mesh ask)")
+        console.print("    - Summary reports with AI insights")
+        console.print("    - Advanced MCP tools")
+        console.print("")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
 
 
 def main():
