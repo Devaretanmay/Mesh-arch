@@ -458,27 +458,15 @@ def logout():
 
 
 @cli.command()
-@click.option("--tier", type=click.Choice(["personal", "org"]), help="Select tier to upgrade")
-def upgrade(tier):
-    """Upgrade to Mesh Pro.
+def upgrade():
+    """Show Mesh Pro upgrade pricing and features.
 
-    Opens Stripe checkout for payment.
-
-    Examples:
-
-      mesh upgrade           # Show upgrade options
-
-      mesh upgrade --tier personal   # Start Personal Pro checkout
-
-      mesh upgrade --tier org        # Start Org Pro checkout
+    Payment integration coming soon.
     """
     from mesh.auth.tier import get_detector
-    from mesh.payment.stripe import get_manager
-    import webbrowser
 
     detector = get_detector()
     auth_info = detector.get_auth_info()
-    stripe_manager = get_manager()
 
     console.print("")
     console.print("-" * 40)
@@ -490,10 +478,7 @@ def upgrade(tier):
         console.print("  [yellow]Please login first: mesh login[/yellow]")
         return
 
-    is_org = detector.is_org_user()
-    selected_tier = tier or ("org" if is_org else "personal")
-
-    if is_org:
+    if detector.is_org_user():
         console.print(f"  Logged in as: {auth_info.login}")
         console.print(f"  Organization(s): {', '.join(auth_info.orgs_with_members)}")
         console.print("")
@@ -505,6 +490,8 @@ def upgrade(tier):
         console.print("    - Team-wide analysis")
         console.print("    - Organization dashboard")
         console.print("    - Admin controls")
+        console.print("")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
     else:
         console.print(f"  Logged in as: {auth_info.login}")
         console.print("")
@@ -515,43 +502,8 @@ def upgrade(tier):
         console.print("    - AI-powered codebase queries (mesh ask)")
         console.print("    - Summary reports with AI insights")
         console.print("    - Advanced MCP tools")
-
-    console.print("")
-
-    if not stripe_manager.is_configured():
-        console.print("  [yellow]Stripe not configured.[/yellow]")
-        console.print("  Set STRIPE_SECRET_KEY environment variable.")
-        console.print("  Visit https://dashboard.stripe.com to get started.")
-        return
-
-    if selected_tier == "org" and is_org:
-        console.print("  Starting checkout for Organization Pro...")
-        session = stripe_manager.create_org_pro_checkout(
-            user_id=str(auth_info.user_id),
-            user_email=f"{auth_info.login}@users.noreply.github.com",
-            org_name=auth_info.orgs_with_members[0] if auth_info.orgs_with_members else "",
-            discount=False,
-        )
-    else:
-        console.print("  Starting checkout for Personal Pro...")
-        session = stripe_manager.create_personal_pro_checkout(
-            user_id=str(auth_info.user_id),
-            user_email=f"{auth_info.login}@users.noreply.github.com",
-        )
-
-    if session:
         console.print("")
-        console.print("  [green]Opening Stripe checkout...[/green]")
-        console.print(f"  [dim]{session.url}[/dim]")
-        try:
-            webbrowser.open(session.url)
-        except Exception:
-            console.print("  Copy this URL to complete payment:")
-            console.print(f"  {session.url}")
-    else:
-        console.print("")
-        console.print("  [red]Failed to create checkout session.[/red]")
-        console.print("  Please try again later.")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
 
 
 def main():
