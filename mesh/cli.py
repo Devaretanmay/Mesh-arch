@@ -1,7 +1,10 @@
 """
 CLI module for Mesh v2.0.
 
-Uses local LLM inference with llama-cpp-python (Qwen2.5-Coder-1.5B).
+Rewired to use new core:
+  - ast-grep-py for parsing (26 languages)
+  - rustworkx for graphs
+  - SQLite for storage
 """
 
 import sys
@@ -77,23 +80,37 @@ def init(root):
 @click.option("--root", default=".", help="Codebase root directory")
 def status(root):
     """Show Mesh status and statistics."""
+    from mesh.auth.tier import get_detector
+
     codebase_root = Path(root).resolve()
     storage = MeshStorage(codebase_root)
-
-    if not storage.graphs_exist():
-        console.print("  Run 'mesh init' first")
-        storage.close()
-        return
-
-    node_count = storage.node_count()
-    edge_count = storage.edge_count()
+    detector = get_detector()
+    auth_info = detector.get_auth_info()
+    tier_info = detector.get_current_tier()
 
     console.print("")
     console.print("-" * 40)
     console.print("  Mesh Status")
     console.print("-" * 40)
-    console.print(f"  Nodes: {node_count}")
-    console.print(f"  Edges: {edge_count}")
+
+    if auth_info:
+        console.print(f"  Authenticated: {auth_info.login}")
+        console.print(f"  Tier: {tier_info.display_name}")
+        if auth_info.orgs_with_members:
+            console.print(f"  Organizations: {', '.join(auth_info.orgs_with_members)}")
+    else:
+        console.print("  Authenticated: No")
+        console.print("  Tier: Free")
+
+    if storage.graphs_exist():
+        node_count = storage.node_count()
+        edge_count = storage.edge_count()
+        console.print("")
+        console.print(f"  Graph nodes: {node_count}")
+        console.print(f"  Graph edges: {edge_count}")
+    else:
+        console.print("")
+        console.print("  Run 'mesh init' to analyze a codebase")
 
     from mesh.llm import is_model_downloaded, get_model_size_mb
 
@@ -133,13 +150,6 @@ def doctor(root: str, report: bool, json_output: bool) -> None:
     console.print("  Graphs built")
     console.print("  Storage available")
 
-    from mesh.llm import is_model_downloaded
-
-    if is_model_downloaded():
-        console.print("  LLM model downloaded")
-    else:
-        console.print("  LLM model not downloaded")
-
     if report:
         console.print("")
         console.print("-" * 40)
@@ -173,7 +183,30 @@ def doctor(root: str, report: bool, json_output: bool) -> None:
 @cli.command()
 @click.option("--root", default=".", help="Codebase root")
 def serve(root):
-    """Start MCP server for Cursor and Claude Code integration."""
+    """Start MCP server for Cursor and Claude Code integration.
+
+    Requires: Personal Pro or Organization Pro
+    """
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    allowed, reason = detector.is_pro_feature_allowed("serve")
+
+    if not allowed:
+        if reason.startswith("org_upgrade:"):
+            orgs = reason.split(":", 1)[1]
+            console.print("")
+            console.print(f"  [yellow]You are using an organization account ({orgs}).[/yellow]")
+            console.print("  [yellow]Upgrade to Organization Pro to use MCP server.[/yellow]")
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        else:
+            console.print("")
+            console.print("  [yellow]MCP server requires Mesh Pro.[/yellow]")
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        return
+
     from mesh.mcp.server import create_server
 
     codebase_root = Path(root).resolve()
@@ -184,63 +217,24 @@ def serve(root):
 @cli.command()
 def setup():
     """Download LLM model and configure Mesh."""
-    from mesh.llm import download_model, get_model_size_mb
-
-    console.print("")
-    console.print("-" * 40)
-    console.print("  Mesh Setup")
-    console.print("-" * 40)
-    console.print("")
-    console.print("  Downloading Qwen2.5-Coder-1.5B model...")
-    console.print(f"  Size: ~{get_model_size_mb()}MB")
-    console.print("")
-
-    try:
-        path = download_model()
-        console.print("")
-        console.print("  [green]Model downloaded successfully![/green]")
-        console.print(f"  Saved to: {path}")
-    except Exception as e:
-        console.print("")
-        console.print(f"  [red]Download failed: {e}[/red]")
-        console.print("")
-        console.print("  You can try again later with:")
-        console.print("    mesh download-model")
-
-
-@cli.command()
-def download_model():
-    """Download the Qwen2.5-Coder-1.5B model for local inference."""
-    from mesh.llm import download_model, get_model_size_mb, is_model_downloaded
+    from mesh.llm import download_model, is_model_downloaded
 
     if is_model_downloaded():
-        console.print("")
-        console.print("  [green]Model already downloaded![/green]")
-        console.print("  Run 'mesh ask' to start analyzing codebases.")
+        console.print("  Model already downloaded.")
         return
 
     console.print("")
-    console.print("-" * 40)
-    console.print("  Downloading LLM Model")
-    console.print("-" * 40)
-    console.print("")
-    console.print("  Model: Qwen2.5-Coder-1.5B-Instruct")
-    console.print(f"  Size: ~{get_model_size_mb()}MB")
-    console.print("")
-    console.print("  Downloading from HuggingFace...")
+    console.print("  Downloading Qwen2.5-Coder-1.5B-Instruct-GGUF...")
+    console.print("  This may take a few minutes...")
 
-    try:
-        path = download_model()
+    success = download_model()
+
+    if success:
         console.print("")
-        console.print("  [green]Download complete![/green]")
-        console.print(f"  Model saved to: {path}")
+        console.print("  [green]Model downloaded successfully![/green]")
+    else:
         console.print("")
-        console.print("  Run 'mesh ask' to analyze your codebase!")
-    except Exception as e:
-        console.print("")
-        console.print(f"  [red]Download failed: {e}[/red]")
-        console.print("")
-        console.print("  Try again with: mesh download-model")
+        console.print("  [red]Download failed. Run 'mesh download-model' to retry.[/red]")
 
 
 @cli.command()
@@ -257,9 +251,8 @@ def ask(question, root):
 
       mesh ask "how do the verification flows differ?"
 
-    Requires: Qwen2.5-Coder-1.5B model (run 'mesh download-model' first)
+    Requires: Personal Pro or Organization Pro
     """
-    from mesh.llm import is_model_downloaded, download_model, explain_query
     from mesh.auth.tier import get_detector
 
     detector = get_detector()
@@ -269,8 +262,12 @@ def ask(question, root):
         if reason.startswith("org_upgrade:"):
             orgs = reason.split(":", 1)[1]
             console.print("")
-            console.print(f"  [yellow]You are using an organization account ({orgs}).[/yellow]")
-            console.print("  [yellow]Upgrade to Organization Pro to use this feature.[/yellow]")
+            console.print(
+                f"  [yellow]You are using an organization account ({orgs}).[/yellow]"
+            )
+            console.print(
+                "  [yellow]Upgrade to Organization Pro to use this feature.[/yellow]"
+            )
             console.print("")
             console.print("  Run 'mesh upgrade' for pricing.")
         else:
@@ -280,35 +277,39 @@ def ask(question, root):
             console.print("  Run 'mesh upgrade' for pricing.")
         return
 
-    if not is_model_downloaded():
-        console.print("")
-        console.print("  [yellow]Model not downloaded.[/yellow]")
-        console.print("")
-        console.print("  First time setup:")
-        console.print("    mesh download-model")
-        console.print("")
-        console.print("  Download now? [y/N]: ", nl=False)
-        if click.confirm("", default=False):
-            console.print("")
-            try:
-                download_model()
-            except Exception as e:
-                console.print(f"  [red]Download failed: {e}[/red]")
-                return
-        else:
-            return
+    from mesh.llm.explainer import explain_query
 
     root_path = Path(root).resolve()
 
     console.print(f"\n[dim]Analysing: {question}[/dim]")
 
-    try:
-        answer = explain_query(question, root_path)
-        console.print(answer)
-        console.print()
-    except Exception as e:
+    answer = explain_query(question, root_path)
+
+    console.print(answer)
+    console.print()
+
+
+@cli.command()
+def download_model():
+    """Download the Qwen2.5-Coder-1.5B model for local inference."""
+    from mesh.llm import download_model, is_model_downloaded
+
+    if is_model_downloaded():
+        console.print("  Model already downloaded.")
+        return
+
+    console.print("")
+    console.print("  Downloading Qwen2.5-Coder-1.5B-Instruct-GGUF...")
+    console.print("  This may take a few minutes...")
+
+    success = download_model()
+
+    if success:
         console.print("")
-        console.print(f"  [red]Error: {e}[/red]")
+        console.print("  [green]Model downloaded successfully![/green]")
+    else:
+        console.print("")
+        console.print("  [red]Download failed. Run 'mesh download-model' to retry.[/red]")
 
 
 @cli.command()
@@ -396,7 +397,7 @@ def login(token):
         console.print(f"  Tier: {tier_info.display_name}")
         console.print("")
         console.print("  Run 'mesh upgrade' to activate Pro features.")
-        if auth_info and auth_info.orgs_with_members:
+        if auth_info.orgs_with_members:
             console.print(
                 f"  [dim]Orgs with >1 member: {', '.join(auth_info.orgs_with_members)}[/dim]"
             )
