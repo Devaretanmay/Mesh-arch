@@ -4,7 +4,6 @@ Downloads from HuggingFace and caches in ~/.mesh/models/
 """
 
 from pathlib import Path
-from typing import Optional, Callable
 
 from huggingface_hub import hf_hub_download
 
@@ -32,9 +31,7 @@ def get_model_size_mb() -> int:
     return MODEL_SIZE_MB
 
 
-def download_model(
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Path:
+def download_model() -> Path:
     model_dir = get_model_dir()
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -43,19 +40,16 @@ def download_model(
         filename=MODEL_FILE,
         local_dir=str(model_dir),
         local_dir_use_symlinks=False,
-        progress_callback=progress_callback,
     )
     return Path(path)
 
 
-def ensure_model(
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> tuple[Path, bool]:
+def ensure_model() -> tuple[Path, bool]:
     model_path = get_model_path()
     if model_path.exists():
         return model_path, False
 
-    downloaded_path = download_model(progress_callback)
+    downloaded_path = download_model()
     return downloaded_path, True
 
 

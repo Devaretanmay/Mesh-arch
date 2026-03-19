@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+os.environ["GGML_METAL_LOG"] = "0"
+
 from llama_cpp import Llama
 
 
@@ -33,6 +35,8 @@ class LocalLLM:
                 n_ctx=self.n_ctx,
                 n_threads=self._n_threads,
                 verbose=False,
+                logits_all=False,
+                n_gpu_layers=0,
             )
         return self._llm
 

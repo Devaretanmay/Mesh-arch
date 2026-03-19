@@ -12,13 +12,9 @@ from mesh.llm.downloader import ensure_model
 
 
 SYSTEM_PROMPT = """You are Mesh, an expert code analysis assistant. 
-You analyze codebases and provide clear, concise explanations of:
-- How code works
-- Architecture and patterns
-- Function purposes and relationships
-- Data flows and dependencies
+You analyze codebases and provide clear, concise explanations of code architecture.
 
-Be specific and reference actual function names and file paths."""
+Be specific and reference actual function names and file paths when explaining."""
 
 
 class CodeExplainer:
@@ -35,25 +31,31 @@ class CodeExplainer:
         self,
         query: str,
         context: dict,
-        max_tokens: int = 1024,
+        max_tokens: int = 512,
     ) -> str:
         llm = self._get_llm()
         
         functions = context.get("functions", [])
         call_graph = context.get("call_graph", "")
+        files = context.get("files", [])
         violations = context.get("violations", [])
 
         prompt_parts = []
+        
+        if files:
+            file_list = "\n".join(f"- {f}" for f in files[:20])
+            prompt_parts.append(f"Key files in codebase:\n{file_list}")
+
         if functions:
-            func_list = "\n".join(f"- {f}" for f in functions[:20])
-            prompt_parts.append(f"Relevant functions:\n{func_list}")
+            func_list = "\n".join(f"- {f}" for f in functions[:30])
+            prompt_parts.append(f"Functions in codebase:\n{func_list}")
 
         if call_graph:
-            prompt_parts.append(f"\nCall relationships:\n{call_graph}")
+            prompt_parts.append(f"Call relationships:\n{call_graph}")
 
         if violations:
             violation_list = "\n".join(f"- {v}" for v in violations[:10])
-            prompt_parts.append(f"\nArchitectural issues:\n{violation_list}")
+            prompt_parts.append(f"Architectural issues:\n{violation_list}")
 
         context_str = "\n\n".join(prompt_parts) if prompt_parts else "No additional context."
 
@@ -61,12 +63,13 @@ class CodeExplainer:
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"""Context from codebase analysis:
+                "content": f"""Analyze this codebase based on the following context:
+
 {context_str}
 
 Question: {query}
 
-Provide a clear, concise answer based on the code.""",
+Answer the question based on the provided context. If the context doesn't contain enough information, say so.""",
             },
         ]
 
@@ -112,7 +115,6 @@ Provide a brief architectural summary of the codebase.""",
 
 
 def explain_query(query: str, root_path: Path) -> str:
-    from mesh.core.storage import MeshStorage
     from mesh.analysis.builder import AnalysisBuilder
 
     storage = MeshStorage(root_path)
@@ -125,7 +127,14 @@ def explain_query(query: str, root_path: Path) -> str:
         storage = MeshStorage(root_path)
 
     nodes = storage.get_nodes()
+    
+    files: dict[str, int] = {}
+    for n in nodes:
+        fp = n.get("file_path", "unknown")
+        files[fp] = files.get(fp, 0) + 1
+    
     context = {
+        "files": list(files.keys()),
         "functions": [n.get("name", "") for n in nodes],
         "call_graph": _build_call_graph_summary(storage),
         "violations": [],
