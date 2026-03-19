@@ -1,6 +1,6 @@
 [project]
 name = "mesh-arch"
-version = "1.0.9"
+version = "2.0.0"
 requires-python = ">=3.10"
 description = "Architectural coherence layer for AI-generated codebases"
 dependencies = [
