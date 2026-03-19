@@ -87,10 +87,10 @@ def goodbye():
 """)
 
             parser = UniversalParser(Path(tmpdir))
-            functions = parser.parse_file(test_file, Path(tmpdir))
+            result = parser.parse_file(test_file, Path(tmpdir))
 
-            assert len(functions) == 2
-            names = [f.name for f in functions]
+            assert len(result.functions) == 2
+            names = [f.name for f in result.functions]
             assert "hello_world" in names
             assert "goodbye" in names
 
@@ -138,6 +138,7 @@ class TestMeshStorage:
                 file_path="test.py",
                 data={"name": "test_func", "line": 10},
             )
+            storage.flush()
 
             nodes = storage.get_nodes("call")
             assert len(nodes) == 1

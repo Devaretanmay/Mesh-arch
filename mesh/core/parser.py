@@ -1,8 +1,13 @@
 """
-UniversalParser — 25-language parser using ast-grep.
+UniversalParser — High-performance 25-language parser using ast-grep.
 
-Parses any supported language into Mesh FunctionNodes.
-Uses ast-grep-py from code-graph-mcp (Apache 2.0).
+Optimizations:
+- Parallel file processing with ThreadPoolExecutor
+- Single-pass parsing (functions + classes together)
+- Batch processing with progress callbacks
+- Comprehensive file filtering
+- Memory-efficient processing
+- Error resilience
 
 Language support:
   Python, TypeScript, JavaScript, Java, Go, Rust, C, C++, C#,
@@ -13,22 +18,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from ast_grep_py import SgRoot
 
 logger = logging.getLogger(__name__)
 
 
-# Language → ast-grep language name mapping
 LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
     ".ts": "typescript",
     ".tsx": "tsx",
-    ".js": "javascript",
-    ".jsx": "javascript",
+    ".js": "typescript",
+    ".jsx": "tsx",
     ".mjs": "javascript",
     ".cjs": "javascript",
     ".java": "java",
@@ -50,29 +56,17 @@ LANGUAGE_MAP: dict[str, str] = {
     ".scala": "scala",
     ".vue": "vue",
     ".svelte": "svelte",
+    ".lua": "lua",
+    ".pl": "perl",
+    ".r": "r",
+    ".scala": "scala",
 }
 
-# Function definition node types per language
 FUNCTION_NODES: dict[str, list[str]] = {
     "python": ["function_definition", "async_function_definition"],
-    "typescript": [
-        "function_declaration",
-        "method_definition",
-        "arrow_function",
-        "function_expression",
-    ],
-    "tsx": [
-        "function_declaration",
-        "method_definition",
-        "arrow_function",
-        "function_expression",
-    ],
-    "javascript": [
-        "function_declaration",
-        "method_definition",
-        "arrow_function",
-        "function_expression",
-    ],
+    "typescript": ["function_declaration", "method_definition", "arrow_function", "function_expression"],
+    "tsx": ["function_declaration", "method_definition", "arrow_function", "function_expression"],
+    "javascript": ["function_declaration", "method_definition", "arrow_function", "function_expression"],
     "java": ["method_declaration", "constructor_declaration"],
     "go": ["function_declaration", "method_declaration"],
     "rust": ["function_item"],
@@ -84,9 +78,12 @@ FUNCTION_NODES: dict[str, list[str]] = {
     "ruby": ["function", "def"],
     "php": ["function_definition", "method_declaration"],
     "dart": ["function_definition", "method_definition"],
+    "lua": ["function_declaration"],
+    "perl": ["subroutine_declaration"],
+    "r": ["function_definition"],
+    "scala": ["function_definition", "class_definition"],
 }
 
-# Call expression node types per language
 CALL_NODES: dict[str, list[str]] = {
     "python": ["call"],
     "typescript": ["call_expression"],
@@ -103,14 +100,17 @@ CALL_NODES: dict[str, list[str]] = {
     "ruby": ["call", "send"],
     "php": ["call_expression"],
     "dart": ["method_invocation"],
+    "lua": ["function_call"],
+    "perl": ["function_call"],
+    "r": ["function_call"],
+    "scala": ["method_invocation"],
 }
 
-# Class definition node types per language
 CLASS_NODES: dict[str, list[str]] = {
     "python": ["class_definition"],
-    "typescript": ["class_declaration", "class_expression"],
+    "typescript": ["class_declaration", "class_expression", "interface_declaration"],
     "tsx": ["class_declaration", "class_expression"],
-    "javascript": ["class_declaration", "class_expression"],
+    "javascript": ["class_declaration", "class_expression", "interface_declaration"],
     "java": ["class_declaration", "interface_declaration", "enum_declaration"],
     "go": ["type_declaration"],
     "rust": ["struct_item", "impl_item", "enum_item"],
@@ -119,13 +119,37 @@ CLASS_NODES: dict[str, list[str]] = {
     "c_sharp": ["class_declaration", "interface_declaration", "struct_declaration"],
     "cpp": ["class_specifier", "struct_specifier"],
     "dart": ["class_definition", "enum_definition"],
+    "lua": ["function_declaration"],
+    "perl": ["class_declaration"],
+    "r": ["class_definition"],
+    "scala": ["class_definition", "object_definition", "trait_definition"],
+}
+
+IMPORT_NODES: dict[str, list[str]] = {
+    "python": ["import_statement", "import_from_statement"],
+    "typescript": ["import_statement", "import_clause"],
+    "tsx": ["import_statement", "import_clause"],
+    "javascript": ["import_statement", "import_clause"],
+    "java": ["import_declaration"],
+    "go": ["import_declaration"],
+    "rust": ["use_declaration"],
+    "kotlin": ["import_directive"],
+    "swift": ["import_declaration"],
+    "c_sharp": ["using_directive"],
+    "cpp": ["using_declaration", "include_statement"],
+    "c": ["include_statement"],
+    "ruby": ["require_statement", "require_relative"],
+    "php": ["use_declaration", "require_once_statement"],
+    "dart": ["import_directive"],
+    "lua": ["require"],
+    "perl": ["use_statement", "require_statement"],
+    "r": ["library_statement", "require_statement"],
+    "scala": ["import_statement"],
 }
 
 
 @dataclass
 class ParsedFunction:
-    """A parsed function from source code."""
-
     id: str
     name: str
     file_path: str
@@ -137,8 +161,6 @@ class ParsedFunction:
     params: list[str] = field(default_factory=list)
     returns: list[str] = field(default_factory=list)
     kind: str = "function"
-    data: dict = field(default_factory=dict)
-    # Control flow fields
     is_async: bool = False
     decorators: list[str] = field(default_factory=list)
     branches: list[dict] = field(default_factory=list)
@@ -146,12 +168,11 @@ class ParsedFunction:
     exception_handlers: list[dict] = field(default_factory=list)
     awaits: list[str] = field(default_factory=list)
     raises: list[str] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ParsedClass:
-    """A parsed class/type from source code."""
-
     id: str
     name: str
     file_path: str
@@ -161,215 +182,191 @@ class ParsedClass:
     methods: list[str] = field(default_factory=list)
     attributes: list[str] = field(default_factory=list)
     kind: str = "class"
-    data: dict = field(default_factory=dict)
+
+
+@dataclass
+class ParseResult:
+    functions: list[ParsedFunction]
+    classes: list[ParsedClass]
+    errors: list[str]
+
+
+@dataclass
+class FileHash:
+    path: str
+    mtime: float
+    size: int
+    hash: str
 
 
 class UniversalParser:
-    """
-    Parses any supported language into Mesh FunctionNodes.
-
-    Uses ast-grep-py for parsing.
-    Falls back gracefully for unsupported languages.
-    """
-
     EXCLUDED_DIRS: set[str] = {
-        "node_modules",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        "site-packages",
-        "dist",
-        "build",
-        "__pycache__",
-        ".next",
-        "out",
-        "target",
-        "bin",
-        "obj",
-        ".git",
-        ".svn",
-        "generated",
-        "gen",
-        ".idea",
-        ".vscode",
-        "migrations",
-        "fixtures",
-        "tests",
-        ".pytest_cache",
-        ".tox",
-        ".eggs",
-        "*.egg-info",
+        "node_modules", "vendor", ".venv", "venv", "env", "site-packages",
+        "dist", "build", "__pycache__", ".next", "out", "target", "bin", "obj",
+        ".git", ".svn", ".hg", "generated", "gen", ".idea", ".vscode",
+        ".pytest_cache", ".tox", ".eggs", ".pytest_cache",
+        "bower_components", ".sass-cache", ".cache",
     }
-
-    MAX_FILE_SIZE = 1024 * 1024  # 1MB max file size
-
-    def __init__(self, root: Path | None = None):
-        """
-        Initialize parser.
-
-        Args:
-            root: Root directory for relative paths
-        """
+    
+    EXCLUDED_FILES: set[str] = {
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "poetry.lock", "Pipfile.lock", "requirements.txt",
+        "setup.py", "setup.cfg", "pyproject.toml", "Makefile",
+        ".DS_Store", "Thumbs.db",
+    }
+    
+    EXCLUDED_EXTENSIONS: set[str] = {
+        ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".bin",
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".svg",
+        ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov",
+        ".ttf", ".otf", ".woff", ".woff2",
+        ".env", ".example",
+    }
+    
+    MAX_FILE_SIZE = 512 * 1024  # 512KB max (reduced for faster parsing)
+    
+    def __init__(self, root: Path | None = None, workers: int = 4):
         self._root = root
+        self._workers = min(workers, os.cpu_count() or 4)
+        self._progress_callback: Callable[[str, int, int], None] | None = None
 
     @property
     def root(self) -> Path | None:
-        """Get root directory."""
         return self._root
 
     @root.setter
     def root(self, value: Path | None):
-        """Set root directory."""
         self._root = value
 
+    def set_progress_callback(self, callback: Callable[[str, int, int], None] | None):
+        self._progress_callback = callback
+
+    def _report_progress(self, message: str, current: int, total: int):
+        if self._progress_callback:
+            self._progress_callback(message, current, total)
+
     def get_language(self, file_path: Path) -> str | None:
-        """Get ast-grep language for file extension."""
-        return LANGUAGE_MAP.get(file_path.suffix.lower())
+        ext = file_path.suffix.lower()
+        if ext.startswith("."):
+            return LANGUAGE_MAP.get(ext)
+        return None
 
     def is_supported(self, file_path: Path) -> bool:
-        """Check if file language is supported."""
         return self.get_language(file_path) is not None
 
     def should_skip(self, file_path: Path, root: Path) -> bool:
-        """
-        Check if file should be skipped.
-
-        Args:
-            file_path: File to check
-            root: Root directory
-
-        Returns:
-            True if file should be skipped
-        """
         try:
             relative = file_path.relative_to(root)
         except ValueError:
             return True
 
-        # Check excluded directories
+        if relative.name in self.EXCLUDED_FILES:
+            return True
+
+        ext = file_path.suffix.lower()
+        if ext in self.EXCLUDED_EXTENSIONS:
+            return True
+
         parts = relative.parts
         for part in parts:
             if part in self.EXCLUDED_DIRS:
                 return True
 
-        # Check file size
         try:
-            if file_path.stat().st_size > self.MAX_FILE_SIZE:
+            stat = file_path.stat()
+            if stat.st_size > self.MAX_FILE_SIZE:
+                return True
+            if stat.st_size == 0:
                 return True
         except OSError:
             return True
 
         return False
 
-    def parse_file(self, file_path: Path, root: Path) -> list[ParsedFunction]:
-        """
-        Parse file, return list of functions.
+    def _read_file(self, file_path: Path) -> tuple[str | None, str | None]:
+        try:
+            code = file_path.read_text(encoding="utf-8", errors="replace")
+            return code, None
+        except (OSError, UnicodeDecodeError) as e:
+            return None, str(e)
 
-        Args:
-            file_path: Path to file
-            root: Root directory for relative paths
-
-        Returns:
-            List of ParsedFunction objects
-        """
-        # Check if should skip
+    def parse_file(self, file_path: Path, root: Path) -> ParseResult:
         if self.should_skip(file_path, root):
-            return []
+            return ParseResult(functions=[], classes=[], errors=[])
 
-        # Check if supported
         language = self.get_language(file_path)
         if language is None:
-            return []
+            return ParseResult(functions=[], classes=[], errors=[])
 
-        # Read file
-        try:
-            code = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            return []
+        code, error = self._read_file(file_path)
+        if error:
+            return ParseResult(functions=[], classes=[], errors=[f"{file_path}: {error}"])
 
         return self.parse_code(code, str(file_path), language)
 
-    def parse_code(
-        self, code: str, file_path: str, language: str
-    ) -> list[ParsedFunction]:
-        """
-        Parse code string into functions.
+    def parse_code(self, code: str, file_path: str, language: str) -> ParseResult:
+        functions = []
+        classes = []
+        errors = []
 
-        Args:
-            code: Source code
-            file_path: File path for IDs
-            language: ast-grep language name
-
-        Returns:
-            List of ParsedFunction objects
-        """
         try:
-            root = SgRoot(code, language)
-        except Exception:
-            return []
+            sg_root = SgRoot(code, language)
+        except Exception as e:
+            return ParseResult(functions=[], classes=[], errors=[f"{file_path}: {e}"])
 
         func_kinds = FUNCTION_NODES.get(language, [])
-        if not func_kinds:
-            return []
-
-        functions = []
-
-        # Find all function definitions
         for kind in func_kinds:
             try:
-                matches = root.root().find_all(kind=kind)
-            except Exception:
-                continue
+                for match in sg_root.root().find_all(kind=kind):
+                    try:
+                        func = self._extract_function(match, file_path, language, code)
+                        if func:
+                            functions.append(func)
+                    except Exception as e:
+                        errors.append(f"Function extraction error: {e}")
+            except Exception as e:
+                errors.append(f"Function find error ({kind}): {e}")
 
-            for match in matches:
-                try:
-                    func = self._extract_function(match, file_path, language, code)
-                    if func:
-                        functions.append(func)
-                except Exception:
-                    continue
+        class_kinds = CLASS_NODES.get(language, [])
+        for kind in class_kinds:
+            try:
+                for match in sg_root.root().find_all(kind=kind):
+                    try:
+                        cls = self._extract_class(match, file_path, language, code)
+                        if cls:
+                            classes.append(cls)
+                    except Exception as e:
+                        errors.append(f"Class extraction error: {e}")
+            except Exception as e:
+                errors.append(f"Class find error ({kind}): {e}")
 
-        return functions
+        imports = self._find_imports(sg_root, language)
 
-    def _extract_function(
-        self,
-        match: Any,
-        file_path: str,
-        language: str,
-        source: str,
-    ) -> ParsedFunction | None:
-        """Extract function data from ast-grep match."""
+        for func in functions:
+            func.imports = imports
+
+        return ParseResult(functions=functions, classes=classes, errors=errors)
+
+    def _extract_function(self, match: Any, file_path: str, language: str, source: str) -> ParsedFunction | None:
         try:
             text = match.text()
             range_info = match.range()
+            
+            line_start = getattr(range_info.start, 'line', 0) or 0
+            line_end = getattr(range_info.end, 'line', 0) or 0
 
-            # Extract line numbers
-            line_start = range_info.start.line if hasattr(range_info, "start") else 0
-            line_end = range_info.end.line if hasattr(range_info, "end") else 0
-
-            # Extract function name
-            name = self._extract_name(match, language)
+            name = self._extract_name(match, language, text)
             if not name:
                 return None
 
-            # Generate stable ID
             func_id = self._make_function_id(file_path, name)
 
-            # Extract signature (first line)
-            lines = text.split("\n")
-            signature = lines[0] if lines else text
-
-            # Extract docstring (if present)
+            signature = text.split("\n")[0] if text else text
             docstring = self._extract_docstring(match, source)
-
-            # Find calls within function
             calls = self._find_calls(match, language, source)
-
-            # Extract params and returns (data flow)
             params, returns = self._extract_params_and_returns(match, source)
 
-            # Extract control flow (Python only)
             is_async = False
             decorators = []
             branches = []
@@ -377,172 +374,153 @@ class UniversalParser:
             exception_handlers = []
             awaits = []
             raises = []
+
             if language == "python":
-                cf = self._extract_control_flow(match, source)
-                is_async = cf.get("is_async", False)
-                decorators = cf.get("decorators", [])
-                branches = cf.get("branches", [])
-                loops = cf.get("loops", [])
-                exception_handlers = cf.get("exception_handlers", [])
-                awaits = cf.get("awaits", [])
-                raises = cf.get("raises", [])
+                try:
+                    cf = self._extract_control_flow(text)
+                    is_async = cf.get("is_async", False)
+                    decorators = cf.get("decorators", [])
+                    branches = cf.get("branches", [])
+                    loops = cf.get("loops", [])
+                    exception_handlers = cf.get("exception_handlers", [])
+                    awaits = cf.get("awaits", [])
+                    raises = cf.get("raises", [])
+                except Exception:
+                    pass
 
             return ParsedFunction(
-                id=func_id,
-                name=name,
-                file_path=file_path,
-                line_start=line_start,
-                line_end=line_end,
-                signature=signature,
-                docstring=docstring,
-                calls=calls,
-                params=params,
-                returns=returns,
-                kind="function",
-                is_async=is_async,
-                decorators=decorators,
-                branches=branches,
-                loops=loops,
-                exception_handlers=exception_handlers,
-                awaits=awaits,
-                raises=raises,
+                id=func_id, name=name, file_path=file_path,
+                line_start=line_start, line_end=line_end,
+                signature=signature, docstring=docstring, calls=calls,
+                params=params, returns=returns, kind="function",
+                is_async=is_async, decorators=decorators, branches=branches,
+                loops=loops, exception_handlers=exception_handlers,
+                awaits=awaits, raises=raises,
             )
         except Exception:
             return None
 
-    def _extract_name(self, match: Any, language: str) -> str | None:
-        """Extract function name from match."""
+    def _extract_name(self, match: Any, language: str, text: str) -> str | None:
         try:
-            # Try to get the name node
             if hasattr(match, "children"):
                 for child in match.children():
                     if hasattr(child, "kind"):
                         kind = child.kind().lower()
                         if "identifier" in kind or "name" in kind:
-                            return child.text()
+                            name = child.text()
+                            if name and name.isidentifier():
+                                return name
 
-            # Fallback: extract from text
-            text = match.text()
-            # For python: def func_name(...)
-            if "def " in text:
+            if language == "python" and "def " in text:
                 start = text.index("def ") + 4
                 end = text.index("(", start)
                 return text[start:end].strip()
-
+            
             return None
         except Exception:
             return None
 
     def _extract_docstring(self, match: Any, source: str) -> str:
-        """Extract docstring from function."""
         try:
             text = match.text()
             lines = text.split("\n")
-
-            # Simple heuristic: first string literal after opening paren
-            for i, line in enumerate(lines[1:], 1):
+            for line in lines[1:]:
                 line = line.strip()
                 if line.startswith('"""') or line.startswith("'''"):
-                    return line.strip("\"'")
+                    return line.strip('"\'').strip()
                 if line.startswith('"') or line.startswith("'"):
-                    return line.strip("\"'")
-
+                    return line.strip('"\'').strip()
             return ""
         except Exception:
             return ""
 
     def _find_calls(self, match: Any, language: str, source: str) -> list[str]:
-        """Find function calls within function body."""
         call_kinds = CALL_NODES.get(language, [])
         calls = []
 
         for kind in call_kinds:
             try:
-                sub_matches = match.find_all(kind=kind)
+                for sub in match.find_all(kind=kind):
+                    try:
+                        name = self._extract_call_name(sub, language)
+                        if name and name not in calls:
+                            calls.append(name)
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
-            for sub in sub_matches:
-                try:
-                    name = self._extract_call_name(sub, language)
-                    if name:
-                        calls.append(name)
-                except Exception:
-                    continue
-
-        return list(set(calls))  # Deduplicate
+        return calls
 
     def _extract_call_name(self, match: Any, language: str) -> str | None:
-        """Extract function being called."""
         try:
             text = match.text()
-
-            # Simple: get first identifier
             if "(" in text:
-                name = text[: text.index("(")].strip()
+                name = text[:text.index("(")].strip().split(".")[-1]
                 if name and name.isidentifier():
                     return name
-
-            return text if text.isidentifier() else None
+            return text.split(".")[-1] if text.isidentifier() else None
         except Exception:
             return None
 
-    def _make_function_id(self, file_path: str, function_name: str) -> str:
-        """
-        Generate SHA256-based stable function ID.
+    def _find_imports(self, sg_root: Any, language: str) -> list[str]:
+        imports = []
+        import_kinds = IMPORT_NODES.get(language, [])
 
-        Format: sha256(rel_path:function_name)[:16]
-        """
-        content = f"{file_path}:{function_name}"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+        for kind in import_kinds:
+            try:
+                for imp in sg_root.root().find_all(kind=kind):
+                    try:
+                        text = imp.text()
+                        if "from " in text:
+                            start = text.index("from ") + 5
+                            end = text.index(" import") if " import" in text else len(text)
+                            module = text[start:end].strip()
+                        elif "import " in text:
+                            module = text.replace("import ", "").strip()
+                        else:
+                            module = text.strip()
+                        
+                        if module and module not in imports:
+                            imports.append(module)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
 
-    def _extract_params_and_returns(
-        self, match: Any, source: str
-    ) -> tuple[list[str], list[str]]:
-        """Extract parameters and return values from function."""
+        return imports
+
+    def _extract_params_and_returns(self, match: Any, source: str) -> tuple[list[str], list[str]]:
         params = []
         returns = []
 
         try:
             text = match.text()
 
-            # Extract parameters
             if "(" in text and ")" in text:
                 paren_start = text.index("(")
                 paren_end = text.index(")")
-                params_str = text[paren_start + 1 : paren_end]
+                params_str = text[paren_start + 1:paren_end]
                 for p in params_str.split(","):
-                    p = p.strip().replace(",", "").split(":")[0].strip()
-                    if p and p not in ("self", "cls"):
+                    p = p.strip().replace(",", "").split(":")[0].split("=")[0].strip()
+                    if p and p not in ("self", "cls", "*args", "**kwargs") and p not in params:
                         params.append(p)
 
-            # Extract return values
             if "return " in text:
                 for line in text.split("\n"):
                     if "return " in line:
-                        ret = line.split("return ")[1].strip()
-                        if ret and ret != "None":
+                        ret = line.split("return ", 1)[1].strip()
+                        if ret and ret not in ("None", "pass"):
                             ret_clean = ret.split(",")[0].strip()
                             if ret_clean not in returns:
                                 returns.append(ret_clean)
+
         except Exception:
             pass
 
         return params, returns
 
-    def _extract_control_flow(self, match: Any, source: str) -> dict[str, Any]:
-        """
-        Extract control flow information from function.
-
-        Returns dict with:
-        - is_async: bool
-        - decorators: list[str]
-        - branches: list[dict] - if/else branches
-        - loops: list[dict] - for/while loops
-        - exception_handlers: list[dict] - try/except
-        - awaits: list[str] - awaited calls
-        - raises: list[str] - raised exceptions
-        """
+    def _extract_control_flow(self, text: str) -> dict[str, Any]:
         import ast
 
         result = {
@@ -556,167 +534,73 @@ class UniversalParser:
         }
 
         try:
-            text = match.text()
             tree = ast.parse(text)
         except Exception:
             return result
 
         for node in ast.walk(tree):
-            # Check for async function
             if isinstance(node, ast.AsyncFunctionDef):
                 result["is_async"] = True
 
-            # Extract decorators
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
-                    dec_name = ast.unparse(decorator) if hasattr(ast, "unparse") else ""
-                    if not dec_name:
-                        dec_name = getattr(decorator, "attr", None) or getattr(
-                            decorator, "id", ""
-                        )
-                    if dec_name:
-                        result["decorators"].append(dec_name)
+                    try:
+                        dec_name = getattr(decorator, "attr", None) or getattr(decorator, "id", None) or ""
+                        if not dec_name:
+                            dec_name = ast.unparse(decorator) if hasattr(ast, "unparse") else ""
+                        if dec_name:
+                            result["decorators"].append(dec_name)
+                    except Exception:
+                        continue
 
-            # Extract if/else branches
             if isinstance(node, ast.If):
-                branch = {
-                    "type": "if",
-                    "line": node.lineno,
-                    "condition": (
-                        ast.unparse(node.test) if hasattr(ast, "unparse") else ""
-                    ),
-                }
-                result["branches"].append(branch)
+                try:
+                    condition = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
+                    result["branches"].append({"type": "if", "line": node.lineno, "condition": condition})
+                except Exception:
+                    result["branches"].append({"type": "if", "line": node.lineno, "condition": ""})
 
-            # Extract loops
             if isinstance(node, (ast.For, ast.While)):
-                loop = {
+                result["loops"].append({
                     "type": "for" if isinstance(node, ast.For) else "while",
-                    "line": node.lineno,
-                }
-                if isinstance(node, ast.For) and node.target:
-                    loop["iterator"] = (
-                        ast.unparse(node.target) if hasattr(ast, "unparse") else ""
-                    )
-                result["loops"].append(loop)
+                    "line": node.lineno
+                })
 
-            # Extract try/except
             if isinstance(node, ast.Try):
                 for handler in node.handlers:
-                    exc_type = (
-                        ast.unparse(handler.type)
-                        if handler.type and hasattr(ast, "unparse")
-                        else "Exception"
-                    )
-                    result["exception_handlers"].append(
-                        {"type": exc_type, "line": handler.lineno}
-                    )
+                    exc_type = "Exception"
+                    if handler.type:
+                        try:
+                            exc_type = ast.unparse(handler.type) if hasattr(ast, "unparse") else "Exception"
+                        except Exception:
+                            pass
+                    result["exception_handlers"].append({"type": exc_type, "line": handler.lineno or 0})
 
-            # Extract await expressions
             if isinstance(node, ast.Await):
-                await_val = ast.unparse(node.value) if hasattr(ast, "unparse") else ""
-                if await_val:
-                    result["awaits"].append(await_val)
-
-            # Extract raise statements
-            if isinstance(node, ast.Raise):
-                if node.exc:
-                    exc = ast.unparse(node.exc) if hasattr(ast, "unparse") else ""
-                    if exc:
-                        result["raises"].append(exc)
-
-        return result
-
-    def parse_directory(self, root: Path) -> list[ParsedFunction]:
-        """
-        Parse all supported files in directory.
-
-        Args:
-            root: Root directory to parse
-
-        Returns:
-            List of all parsed functions
-        """
-        all_functions = []
-
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-
-            funcs = self.parse_file(file_path, root)
-            all_functions.extend(funcs)
-
-        return all_functions
-
-    def parse_classes_file(self, file_path: Path, root: Path) -> list[ParsedClass]:
-        """
-        Parse file for class/type definitions.
-
-        Args:
-            file_path: Path to file
-            root: Root directory for relative paths
-
-        Returns:
-            List of ParsedClass objects
-        """
-        if self.should_skip(file_path, root):
-            return []
-
-        language = self.get_language(file_path)
-        if language is None:
-            return []
-
-        try:
-            code = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            return []
-
-        return self.parse_classes_code(code, str(file_path), language)
-
-    def parse_classes_code(
-        self, code: str, file_path: str, language: str
-    ) -> list[ParsedClass]:
-        """Parse code string into classes."""
-        try:
-            root = SgRoot(code, language)
-        except Exception:
-            return []
-
-        class_kinds = CLASS_NODES.get(language, [])
-        if not class_kinds:
-            return []
-
-        classes = []
-
-        for kind in class_kinds:
-            try:
-                matches = root.root().find_all(kind=kind)
-            except Exception:
-                continue
-
-            for match in matches:
                 try:
-                    cls = self._extract_class(match, file_path, language, code)
-                    if cls:
-                        classes.append(cls)
+                    await_val = ast.unparse(node.value) if hasattr(ast, "unparse") else ""
+                    if await_val:
+                        result["awaits"].append(await_val)
                 except Exception:
                     continue
 
-        return classes
+            if isinstance(node, ast.Raise):
+                try:
+                    if node.exc:
+                        exc = ast.unparse(node.exc) if hasattr(ast, "unparse") else ""
+                        if exc:
+                            result["raises"].append(exc)
+                except Exception:
+                    continue
 
-    def _extract_class(
-        self,
-        match: Any,
-        file_path: str,
-        language: str,
-        source: str,
-    ) -> ParsedClass | None:
-        """Extract class data from ast-grep match."""
+        return result
+
+    def _extract_class(self, match: Any, file_path: str, language: str, source: str) -> ParsedClass | None:
         try:
             range_info = match.range()
-
-            line_start = range_info.start.line if hasattr(range_info, "start") else 0
-            line_end = range_info.end.line if hasattr(range_info, "end") else 0
+            
+            line_start = getattr(range_info.start, 'line', 0) or 0
+            line_end = getattr(range_info.end, 'line', 0) or 0
 
             name = self._extract_class_name(match, language)
             if not name:
@@ -724,26 +608,19 @@ class UniversalParser:
 
             class_id = self._make_class_id(file_path, name)
 
-            bases = self._extract_bases(match, language, source)
-            methods = self._extract_methods(match, language, source)
-            attributes = self._extract_attributes(match, language, source)
+            bases = self._extract_bases(match, language)
+            methods = self._extract_methods(match, language)
+            attributes = self._extract_attributes(match, language)
 
             return ParsedClass(
-                id=class_id,
-                name=name,
-                file_path=file_path,
-                line_start=line_start,
-                line_end=line_end,
-                bases=bases,
-                methods=methods,
-                attributes=attributes,
-                kind="class",
+                id=class_id, name=name, file_path=file_path,
+                line_start=line_start, line_end=line_end,
+                bases=bases, methods=methods, attributes=attributes, kind="class"
             )
         except Exception:
             return None
 
     def _extract_class_name(self, match: Any, language: str) -> str | None:
-        """Extract class name from match."""
         try:
             if hasattr(match, "children"):
                 for child in match.children():
@@ -755,51 +632,47 @@ class UniversalParser:
             text = match.text()
             if "class " in text:
                 start = text.index("class ") + 6
-                end = text.index("(", start) if "(" in text else len(text)
+                end = text.index("(") if "(" in text else (text.index(":") if ":" in text else len(text))
                 return text[start:end].strip()
-
+            
             return None
         except Exception:
             return None
 
-    def _extract_bases(self, match: Any, language: str, source: str) -> list[str]:
-        """Extract base classes/interfaces."""
+    def _extract_bases(self, match: Any, language: str) -> list[str]:
         bases = []
         try:
             text = match.text()
             if "(" in text:
                 paren_start = text.index("(")
-                paren_end = text.index(")") if ")" in text else len(text)
-                bases_str = text[paren_start + 1 : paren_end]
+                paren_end = text.rindex(")") if ")" in text[paren_start:] else len(text)
+                bases_str = text[paren_start + 1:paren_end]
                 for base in bases_str.split(","):
-                    base = base.strip().replace(",", "")
-                    if base and base != "object":
+                    base = base.strip().replace(",", "").split(":")[0].strip()
+                    if base and base not in ("object", "Exception", "BaseException") and base not in bases:
                         bases.append(base)
         except Exception:
             pass
         return bases
 
-    def _extract_methods(self, match: Any, language: str, source: str) -> list[str]:
-        """Extract method names from class body."""
+    def _extract_methods(self, match: Any, language: str) -> list[str]:
         methods = []
         try:
             text = match.text()
             for line in text.split("\n"):
                 line = line.strip()
                 if line.startswith("def ") or line.startswith("async def "):
-                    func_start = line.index("def ") + 4
-                    if "async def " in line:
-                        func_start = line.index("async def ") + 10
+                    prefix = "def " if line.startswith("def ") else "async def "
+                    func_start = len(prefix)
                     paren = line.index("(") if "(" in line else len(line)
                     name = line[func_start:paren].strip()
-                    if name and not name.startswith("_"):
+                    if name and not name.startswith("_") and name not in methods:
                         methods.append(name)
         except Exception:
             pass
         return methods
 
-    def _extract_attributes(self, match: Any, language: str, source: str) -> list[str]:
-        """Extract attribute assignments from class body."""
+    def _extract_attributes(self, match: Any, language: str) -> list[str]:
         attrs = []
         try:
             text = match.text()
@@ -807,100 +680,77 @@ class UniversalParser:
                 line = line.strip()
                 if ": " in line and "=" in line:
                     attr = line.split("=")[0].strip().replace(":", "").strip()
-                    if attr and not attr.startswith("_"):
+                    if attr and not attr.startswith("_") and attr not in attrs:
                         attrs.append(attr)
         except Exception:
             pass
         return attrs
 
+    def _make_function_id(self, file_path: str, function_name: str) -> str:
+        content = f"{file_path}:{function_name}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
     def _make_class_id(self, file_path: str, class_name: str) -> str:
-        """Generate SHA256-based stable class ID."""
         content = f"{file_path}:{class_name}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    def parse_classes_directory(self, root: Path) -> list[ParsedClass]:
-        """Parse all supported files in directory for classes."""
+    def _parse_file_worker(self, args: tuple) -> ParseResult:
+        file_path, root = args
+        return self.parse_file(file_path, root)
+
+    def parse_directory(self, root: Path) -> ParseResult:
+        all_functions = []
         all_classes = []
+        all_errors = []
+        total_files = 0
+        processed_files = 0
 
+        files_to_process = []
         for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
+            if file_path.is_file() and not self.should_skip(file_path, root):
+                files_to_process.append(file_path)
+                total_files += 1
 
-            classes = self.parse_classes_file(file_path, root)
-            all_classes.extend(classes)
+        self._report_progress("Finding files", processed_files, total_files)
 
-        return all_classes
+        with ThreadPoolExecutor(max_workers=self._workers) as executor:
+            futures = {
+                executor.submit(self._parse_file_worker, (fp, root)): fp
+                for fp in files_to_process
+            }
 
-    def parse_data_flow(
-        self, file_path: Path, root: Path
-    ) -> tuple[list[str], list[str]]:
-        """
-        Parse file for data flow (params and returns).
+            for future in as_completed(futures):
+                processed_files += 1
+                self._report_progress("Parsing", processed_files, total_files)
 
-        Args:
-            file_path: Path to file
-            root: Root directory
-
-        Returns:
-            Tuple of (params, returns) lists
-        """
-        if self.should_skip(file_path, root):
-            return [], []
-
-        language = self.get_language(file_path)
-        if language is None:
-            return [], []
-
-        try:
-            code = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            return [], []
-
-        return self._extract_data_flow(code, language)
-
-    def _extract_data_flow(
-        self, code: str, language: str
-    ) -> tuple[list[str], list[str]]:
-        """Extract parameters and return values from code."""
-        params = []
-        returns = []
-
-        try:
-            root = SgRoot(code, language)
-        except Exception:
-            return [], []
-
-        func_kinds = FUNCTION_NODES.get(language, [])
-
-        for kind in func_kinds:
-            try:
-                matches = root.root().find_all(kind=kind)
-            except Exception:
-                continue
-
-            for match in matches:
                 try:
-                    text = match.text()
+                    result = future.result(timeout=30)
+                    all_functions.extend(result.functions)
+                    all_classes.extend(result.classes)
+                    all_errors.extend(result.errors)
+                except Exception as e:
+                    all_errors.append(f"File parse error: {e}")
 
-                    if "(" in text:
-                        paren_start = text.index("(")
-                        paren_end = text.index(")") if ")" in text else len(text)
-                        params_str = text[paren_start + 1 : paren_end]
-                        for p in params_str.split(","):
-                            p = p.strip().replace(",", "").split(":")[0].strip()
-                            if p and p != "self" and p != "cls":
-                                if p not in params:
-                                    params.append(p)
+        return ParseResult(
+            functions=all_functions,
+            classes=all_classes,
+            errors=all_errors
+        )
 
-                    if "return " in text:
-                        for line in text.split("\n"):
-                            if "return " in line:
-                                ret = line.split("return ")[1].strip()
-                                if ret and ret != "None":
-                                    ret_clean = ret.split(",")[0].strip()
-                                    if ret_clean not in returns:
-                                        returns.append(ret_clean)
+    def get_file_hashes(self, root: Path) -> list[FileHash]:
+        hashes = []
+        for file_path in root.rglob("*"):
+            if file_path.is_file() and not self.should_skip(file_path, root):
+                try:
+                    stat = file_path.stat()
+                    content = file_path.read_bytes()
+                    file_hash = hashlib.md5(content).hexdigest()
+                    hashes.append(FileHash(
+                        path=str(file_path),
+                        mtime=stat.st_mtime,
+                        size=stat.st_size,
+                        hash=file_hash
+                    ))
                 except Exception:
                     continue
-
-        return params, returns
+        return hashes
