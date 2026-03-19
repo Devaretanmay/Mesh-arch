@@ -1,10 +1,7 @@
 """
 CLI module for Mesh v2.0.
 
-Rewired to use new core:
-  - ast-grep-py for parsing (26 languages)
-  - rustworkx for graphs
-  - SQLite for storage
+Uses local LLM inference with llama-cpp-python (Qwen2.5-Coder-1.5B).
 """
 
 import sys
@@ -98,6 +95,16 @@ def status(root):
     console.print(f"  Nodes: {node_count}")
     console.print(f"  Edges: {edge_count}")
 
+    from mesh.llm import is_model_downloaded, get_model_size_mb
+
+    console.print("")
+    if is_model_downloaded():
+        size = get_model_size_mb()
+        console.print(f"  LLM Model: Downloaded ({size}MB)")
+    else:
+        console.print("  LLM Model: Not downloaded")
+        console.print("  Run 'mesh download-model' to download")
+
     storage.close()
 
 
@@ -125,6 +132,13 @@ def doctor(root: str, report: bool, json_output: bool) -> None:
 
     console.print("  Graphs built")
     console.print("  Storage available")
+
+    from mesh.llm import is_model_downloaded
+
+    if is_model_downloaded():
+        console.print("  LLM model downloaded")
+    else:
+        console.print("  LLM model not downloaded")
 
     if report:
         console.print("")
@@ -169,10 +183,64 @@ def serve(root):
 
 @cli.command()
 def setup():
-    """Interactive setup wizard — detects Ollama and selects model."""
-    from mesh.ollama.wizard import run_setup_wizard
+    """Download LLM model and configure Mesh."""
+    from mesh.llm import download_model, get_model_size_mb
 
-    run_setup_wizard(Path(".").resolve())
+    console.print("")
+    console.print("-" * 40)
+    console.print("  Mesh Setup")
+    console.print("-" * 40)
+    console.print("")
+    console.print("  Downloading Qwen2.5-Coder-1.5B model...")
+    console.print(f"  Size: ~{get_model_size_mb()}MB")
+    console.print("")
+
+    try:
+        path = download_model()
+        console.print("")
+        console.print("  [green]Model downloaded successfully![/green]")
+        console.print(f"  Saved to: {path}")
+    except Exception as e:
+        console.print("")
+        console.print(f"  [red]Download failed: {e}[/red]")
+        console.print("")
+        console.print("  You can try again later with:")
+        console.print("    mesh download-model")
+
+
+@cli.command()
+def download_model():
+    """Download the Qwen2.5-Coder-1.5B model for local inference."""
+    from mesh.llm import download_model, get_model_size_mb, is_model_downloaded
+
+    if is_model_downloaded():
+        console.print("")
+        console.print("  [green]Model already downloaded![/green]")
+        console.print("  Run 'mesh ask' to start analyzing codebases.")
+        return
+
+    console.print("")
+    console.print("-" * 40)
+    console.print("  Downloading LLM Model")
+    console.print("-" * 40)
+    console.print("")
+    console.print("  Model: Qwen2.5-Coder-1.5B-Instruct")
+    console.print(f"  Size: ~{get_model_size_mb()}MB")
+    console.print("")
+    console.print("  Downloading from HuggingFace...")
+
+    try:
+        path = download_model()
+        console.print("")
+        console.print("  [green]Download complete![/green]")
+        console.print(f"  Model saved to: {path}")
+        console.print("")
+        console.print("  Run 'mesh ask' to analyze your codebase!")
+    except Exception as e:
+        console.print("")
+        console.print(f"  [red]Download failed: {e}[/red]")
+        console.print("")
+        console.print("  Try again with: mesh download-model")
 
 
 @cli.command()
@@ -188,106 +256,59 @@ def ask(question, root):
       mesh ask "what calls send_email?"
 
       mesh ask "how do the verification flows differ?"
-    """
-    from rich.console import Console
-    from mesh.ollama.explainer import explain_query
 
-    console = Console()
+    Requires: Qwen2.5-Coder-1.5B model (run 'mesh download-model' first)
+    """
+    from mesh.llm import is_model_downloaded, download_model, explain_query
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    allowed, reason = detector.is_pro_feature_allowed("ask")
+
+    if not allowed:
+        if reason.startswith("org_upgrade:"):
+            orgs = reason.split(":", 1)[1]
+            console.print("")
+            console.print(f"  [yellow]You are using an organization account ({orgs}).[/yellow]")
+            console.print("  [yellow]Upgrade to Organization Pro to use this feature.[/yellow]")
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        else:
+            console.print("")
+            console.print("  [yellow]This feature requires Mesh Pro.[/yellow]")
+            console.print("")
+            console.print("  Run 'mesh upgrade' for pricing.")
+        return
+
+    if not is_model_downloaded():
+        console.print("")
+        console.print("  [yellow]Model not downloaded.[/yellow]")
+        console.print("")
+        console.print("  First time setup:")
+        console.print("    mesh download-model")
+        console.print("")
+        console.print("  Download now? [y/N]: ", nl=False)
+        if click.confirm("", default=False):
+            console.print("")
+            try:
+                download_model()
+            except Exception as e:
+                console.print(f"  [red]Download failed: {e}[/red]")
+                return
+        else:
+            return
+
     root_path = Path(root).resolve()
 
     console.print(f"\n[dim]Analysing: {question}[/dim]")
 
-    answer = explain_query(question, root_path)
-
-    console.print(answer)
-    console.print()
-
-
-@cli.group()
-def model():
-    """Manage Ollama model selection."""
-    pass
-
-
-@model.command("list")
-def model_list():
-    """List all available Ollama models with compatibility ratings."""
-    from mesh.ollama.detector import detect_ollama
-    from rich.table import Table
-
-    status = detect_ollama()
-
-    if not status.is_installed:
-        console.print("[red]Ollama not installed.[/red]")
-        console.print("Install from: https://ollama.ai")
-        return
-
-    if not status.is_running:
-        console.print("[yellow]Ollama installed but not running.[/yellow]")
-        console.print("Start with: ollama serve")
-        return
-
-    if not status.models:
-        console.print("[yellow]No models found.[/yellow]")
-        console.print("Pull a model: ollama pull qwen2.5-coder:7b")
-        return
-
-    table = Table(title="Available Ollama Models")
-    table.add_column("Model", style="cyan")
-    table.add_column("Size", justify="right")
-    table.add_column("Compatibility", style="green")
-
-    for m in status.models:
-        size_str = f"{m.size_gb:.1f}GB" if hasattr(m, "size_gb") else "unknown"
-        compat = getattr(m, "compatibility", "unknown")
-        table.add_row(m.name, size_str, compat)
-
-    console.print(table)
-
-
-@model.command("select")
-@click.argument("model_name")
-def model_select(model_name):
-    """Select which Ollama model Mesh uses."""
-    import json
-
-    config_path = Path(".mesh") / "config.json"
-    config_path.parent.mkdir(exist_ok=True)
-
-    config = {}
-    if config_path.exists():
-        try:
-            config = json.loads(config_path.read_text())
-        except Exception:
-            pass
-
-    config["ollama_model"] = model_name
-    config_path.write_text(json.dumps(config, indent=2))
-    console.print(f"Model set to: {model_name}")
-    console.print(f"Config saved to: {config_path}")
-
-
-@model.command("status")
-def model_status():
-    """Show currently selected model and Ollama status."""
-    import json
-
-    from mesh.ollama.detector import detect_ollama
-
-    config_path = Path(".mesh") / "config.json"
-    selected = "not set"
-    if config_path.exists():
-        try:
-            config = json.loads(config_path.read_text())
-            selected = config.get("ollama_model", "not set")
-        except Exception:
-            pass
-
-    status = detect_ollama()
-    console.print(f"Selected model:   {selected}")
-    console.print(f"Ollama installed: {status.is_installed}")
-    console.print(f"Ollama running:   {status.is_running}")
-    console.print(f"Models available: {len(status.models)}")
+    try:
+        answer = explain_query(question, root_path)
+        console.print(answer)
+        console.print()
+    except Exception as e:
+        console.print("")
+        console.print(f"  [red]Error: {e}[/red]")
 
 
 @cli.command()
@@ -338,6 +359,111 @@ def install_hook(root):
         console.print(f"  {result['message']}")
     else:
         console.print(f"  {result['message']}")
+
+
+@cli.command()
+@click.option("--token", help="GitHub Personal Access Token")
+def login(token):
+    """Authenticate with GitHub using a Personal Access Token.
+
+    Get a token from: https://github.com/settings/tokens
+    Required scope: read:user
+    """
+    from mesh.auth.tier import get_detector
+
+    if not token:
+        console.print("")
+        console.print("[yellow]Enter your GitHub Personal Access Token:[/yellow]")
+        console.print("[dim]Get one at: https://github.com/settings/tokens[/dim]")
+        console.print("[dim]Required scope: read:user[/dim]")
+        token = click.prompt("", type=str, hide_input=True)
+
+    if not token.startswith(("ghp_", "github_pat_")):
+        console.print("[red]Error: Token must start with 'ghp_' or 'github_pat_'[/red]")
+        return
+
+    console.print("")
+    console.print("  Authenticating with GitHub...")
+
+    detector = get_detector()
+    success, tier, message = detector.detect_and_save(token)
+
+    if success:
+        tier_info = detector.get_current_tier()
+        auth_info = detector.get_auth_info()
+        console.print("")
+        console.print(f"  [green]Success![/green] {message}")
+        console.print(f"  Tier: {tier_info.display_name}")
+        console.print("")
+        console.print("  Run 'mesh upgrade' to activate Pro features.")
+        if auth_info and auth_info.orgs_with_members:
+            console.print(
+                f"  [dim]Orgs with >1 member: {', '.join(auth_info.orgs_with_members)}[/dim]"
+            )
+    else:
+        console.print(f"  [red]Failed: {message}[/red]")
+
+
+@cli.command()
+def logout():
+    """Clear stored GitHub authentication."""
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    detector.logout()
+
+    console.print("")
+    console.print("  [green]Logged out successfully[/green]")
+    console.print("  Authentication cleared.")
+
+
+@cli.command()
+def upgrade():
+    """Show Mesh Pro upgrade pricing and features.
+
+    Payment integration coming soon.
+    """
+    from mesh.auth.tier import get_detector
+
+    detector = get_detector()
+    auth_info = detector.get_auth_info()
+
+    console.print("")
+    console.print("-" * 40)
+    console.print("  Mesh Pro Upgrade")
+    console.print("-" * 40)
+    console.print("")
+
+    if not auth_info:
+        console.print("  [yellow]Please login first: mesh login[/yellow]")
+        return
+
+    if detector.is_org_user():
+        console.print(f"  Logged in as: {auth_info.login}")
+        console.print(f"  Organization(s): {', '.join(auth_info.orgs_with_members)}")
+        console.print("")
+        console.print("  [bold]Organization Pro[/bold]")
+        console.print("  $10/month per organization")
+        console.print("")
+        console.print("  Features:")
+        console.print("    - All Personal Pro features")
+        console.print("    - Team-wide analysis")
+        console.print("    - Organization dashboard")
+        console.print("    - Admin controls")
+        console.print("")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
+    else:
+        console.print(f"  Logged in as: {auth_info.login}")
+        console.print("")
+        console.print("  [bold]Personal Pro[/bold]")
+        console.print("  $5/month")
+        console.print("")
+        console.print("  Features:")
+        console.print("    - AI-powered codebase queries (mesh ask)")
+        console.print("    - Summary reports with AI insights")
+        console.print("    - Advanced MCP tools")
+        console.print("")
+        console.print("  [dim]Payment integration coming soon.[/dim]")
 
 
 def main():
