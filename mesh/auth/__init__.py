@@ -1,6 +1,6 @@
 """Mesh authentication module.
 
-Provides GitHub PAT-based authentication and tier detection.
+Provides GitHub PAT-based authentication.
 """
 
 from mesh.auth.client import GitHubClient, GitHubUser, GitHubOrg, get_client
@@ -9,13 +9,9 @@ from mesh.auth.tier import (
     TierDetector,
     TierInfo,
     FREE_TIER,
-    PERSONAL_PRO_TIER,
-    ORG_PRO_TIER,
-    ORG_PRO_DISCOUNT_TIER,
+    PRO_TIER,
     TIER_FREE,
-    TIER_PERSONAL_PRO,
-    TIER_ORG_PRO,
-    TIER_ORG_PRO_DISCOUNT,
+    TIER_PRO,
     get_detector,
 )
 
@@ -30,12 +26,8 @@ __all__ = [
     "TierDetector",
     "TierInfo",
     "FREE_TIER",
-    "PERSONAL_PRO_TIER",
-    "ORG_PRO_TIER",
-    "ORG_PRO_DISCOUNT_TIER",
+    "PRO_TIER",
     "TIER_FREE",
-    "TIER_PERSONAL_PRO",
-    "TIER_ORG_PRO",
-    "TIER_ORG_PRO_DISCOUNT",
+    "TIER_PRO",
     "get_detector",
 ]
