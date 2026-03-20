@@ -1,10 +1,11 @@
 """
 CLI module for Mesh v2.0.
 
-Rewired to use new core:
+Features:
   - ast-grep-py for parsing (26 languages)
   - rustworkx for graphs
   - SQLite for storage
+  - Multi-repo workspace support
 """
 
 import sys
@@ -13,9 +14,12 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.table import Table
 
 from mesh.analysis.builder import AnalysisBuilder
+from mesh.analysis.workspace import WorkspaceAnalysisBuilder
 from mesh.core.storage import MeshStorage
+from mesh.core.workspace import get_workspace
 
 console = Console()
 
@@ -28,50 +32,149 @@ def cli():
 
 @cli.command()
 @click.option("--root", default=".", help="Codebase root directory")
-def init(root):
-    """Initialize Mesh analysis on a codebase."""
+@click.option("--repo", multiple=True, help="Specific repo(s) to analyze")
+@click.option("--force", is_flag=True, help="Force re-analysis")
+def init(root, repo, force):
+    """Initialize Mesh analysis on a codebase or workspace.
+    
+    Detects all repos in workspace and analyzes them.
+    Use --repo to analyze specific repos only.
+    """
     codebase_root = Path(root).resolve()
+
+    workspace = get_workspace(codebase_root)
+    
+    if not workspace.repos:
+        console.print("")
+        console.print("  [yellow]No repositories found.[/yellow]")
+        console.print("  Run in a folder containing git repositories.")
+        return
 
     console.print("")
     console.print("-" * 40)
     console.print("  Mesh v2.0 - Initializing")
     console.print("-" * 40)
     console.print("")
-
-    builder = AnalysisBuilder(codebase_root)
-
-    console.print(f"  Root: {codebase_root}")
-    console.print("  Parsing: ast-grep (26 languages)")
-    console.print("  Graph: rustworkx")
-    console.print("  Storage: SQLite")
+    console.print(f"  Workspace: {codebase_root}")
+    console.print(f"  Repos detected: {len(workspace.repos)}")
     console.print("")
 
-    console.print("  Running analysis...")
-    start = time.perf_counter()
-    result = builder.run_full_analysis()
-    elapsed = time.perf_counter() - start
+    if repo:
+        target_repos = [r for r in workspace.repos if r.name in repo or r.id in repo]
+        if not target_repos:
+            console.print(f"  [yellow]Repo(s) not found: {', '.join(repo)}[/yellow]")
+            return
+    else:
+        target_repos = workspace.repos
 
+    console.print(f"  Analyzing: {', '.join(r.name for r in target_repos)}")
     console.print("")
-    console.print(f"  Analysis complete in {elapsed:.2f}s")
-    console.print(f"    Files:     {result.files_analyzed}")
-    console.print(f"    Functions: {result.functions_found}")
-    console.print(f"    Edges:    {result.edges_created}")
 
-    from mesh.core.parser import LANGUAGE_MAP
+    builder = WorkspaceAnalysisBuilder(codebase_root)
+    builder.detect_and_register_repos()
 
-    extensions = {}
-    for f in codebase_root.rglob("*"):
-        if f.is_file() and not builder._parser.should_skip(f, codebase_root):
-            ext = f.suffix.lower()
-            if ext in LANGUAGE_MAP:
-                extensions[ext] = extensions.get(ext, 0) + 1
+    for repo_info in target_repos:
+        console.print(f"  Analyzing {repo_info.name}...")
+        start = time.perf_counter()
+        result = builder.analyze_repo(repo_info, force=force)
+        elapsed = time.perf_counter() - start
 
-    if extensions:
+        console.print(f"    Files: {result.files_analyzed}, Functions: {result.functions_found}, "
+                     f"Classes: {result.classes_found}, Cross-repo: {result.cross_repo_imports} "
+                     f"({elapsed:.2f}s)")
+
+    builder._build_cross_repo_matrix()
+
+    matrix = builder.get_repo_relationships()
+    if matrix:
         console.print("")
-        console.print("  Languages detected:")
-        for ext, count in sorted(extensions.items(), key=lambda x: -x[1])[:10]:
-            lang = LANGUAGE_MAP.get(ext, ext)
-            console.print(f"    {lang:15} {count:5} files")
+        console.print("  Repo Relationships:")
+        for repo_id, deps in matrix.items():
+            if deps.get("depends_on"):
+                console.print(f"    {repo_id} -> {', '.join(deps['depends_on'])}")
+
+    builder.close()
+
+    console.print("")
+    console.print("  [green]Analysis complete![/green]")
+
+
+@cli.command()
+@click.option("--root", default=".", help="Codebase root directory")
+def repos(root):
+    """Show repository relationships and details."""
+    codebase_root = Path(root).resolve()
+
+    builder = WorkspaceAnalysisBuilder(codebase_root)
+    workspace = builder.workspace
+
+    if not workspace.repos:
+        console.print("  [yellow]No repositories found.[/yellow]")
+        builder.close()
+        return
+
+    table = Table(title="Repositories in Workspace")
+    table.add_column("Name", style="cyan")
+    table.add_column("Type", style="green")
+    table.add_column("Functions", justify="right")
+    table.add_column("Classes", justify="right")
+    table.add_column("Edges", justify="right")
+
+    for repo_info in workspace.repos:
+        detail = builder.get_repo_detail(repo_info.id)
+        metrics = detail.get("metrics", {}) if detail else {}
+        node_count = builder.storage.node_count(repo_id=repo_info.id)
+        edge_count = builder.storage.edge_count(repo_id=repo_info.id)
+
+        table.add_row(
+            repo_info.name,
+            repo_info.type,
+            str(metrics.get("functions_found", 0)),
+            str(metrics.get("classes_found", 0)),
+            str(edge_count),
+        )
+
+    console.print("")
+    console.print(table)
+
+    matrix = builder.get_repo_relationships()
+    if matrix:
+        console.print("")
+        console.print("  Dependencies:")
+        for repo_id, deps in matrix.items():
+            if deps.get("depends_on"):
+                console.print(f"    [cyan]{repo_id}[/cyan] depends on: {', '.join(deps['depends_on'])}")
+
+    builder.close()
+
+
+@cli.command()
+@click.option("--root", default=".", help="Codebase root directory")
+@click.option("--repo", help="Focus on specific repo")
+def context(root, repo):
+    """Show complete context graph across all repos."""
+    codebase_root = Path(root).resolve()
+
+    builder = WorkspaceAnalysisBuilder(codebase_root)
+    ctx = builder.get_complete_context()
+
+    console.print("")
+    console.print("-" * 40)
+    console.print("  Complete Context")
+    console.print("-" * 40)
+    console.print("")
+    console.print(f"  Repos: {ctx['stats']['total_repos']}")
+    console.print(f"  Nodes: {ctx['stats']['total_nodes']}")
+    console.print(f"  Edges: {ctx['stats']['total_edges']}")
+
+    if repo:
+        console.print("")
+        console.print(f"  Focusing on: {repo}")
+        repo_edges = [e for e in ctx["edges"] if e["from_repo"] == repo or e["to_repo"] == repo]
+        cross_repo_edges = [e for e in repo_edges if e["from_repo"] != e["to_repo"]]
+        
+        console.print(f"  Edges involving {repo}: {len(repo_edges)}")
+        console.print(f"  Cross-repo edges: {len(cross_repo_edges)}")
 
     builder.close()
 
@@ -81,20 +184,40 @@ def init(root):
 def status(root):
     """Show Mesh status and statistics."""
     codebase_root = Path(root).resolve()
-    storage = MeshStorage(codebase_root)
+    
+    from mesh.analysis.workspace import WorkspaceAnalysisBuilder
+    from mesh.core.workspace import get_workspace
+
+    workspace = get_workspace(codebase_root)
 
     console.print("")
     console.print("-" * 40)
     console.print("  Mesh Status")
     console.print("-" * 40)
 
-    if storage.graphs_exist():
-        node_count = storage.node_count()
-        edge_count = storage.edge_count()
-        console.print(f"  Graph nodes: {node_count}")
-        console.print(f"  Graph edges: {edge_count}")
+    console.print(f"  Workspace: {codebase_root.name}")
+    console.print(f"  Repositories: {len(workspace.repos)}")
+
+    if workspace.repos:
+        builder = WorkspaceAnalysisBuilder(codebase_root)
+        
+        total_nodes = 0
+        total_edges = 0
+        for repo in workspace.repos:
+            total_nodes += builder.storage.node_count(repo_id=repo.id)
+            total_edges += builder.storage.edge_count(repo_id=repo.id)
+
+        console.print(f"  Total nodes: {total_nodes}")
+        console.print(f"  Total edges: {total_edges}")
+
+        matrix = builder.get_repo_relationships()
+        cross_repo = sum(len(d.get("depends_on", [])) for d in matrix.values())
+        if cross_repo > 0:
+            console.print(f"  Cross-repo edges: {cross_repo}")
+
+        builder.close()
     else:
-        console.print("  Run 'mesh init' to analyze a codebase")
+        console.print("  Run 'mesh init' to analyze repositories")
 
     from mesh.llm import is_model_downloaded, get_model_size_mb
 
@@ -105,8 +228,6 @@ def status(root):
     else:
         console.print("  LLM Model: Not downloaded")
         console.print("  Run 'mesh download-model' to download")
-
-    storage.close()
 
 
 @cli.command()

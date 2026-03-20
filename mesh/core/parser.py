@@ -199,6 +199,33 @@ class FileHash:
     hash: str
 
 
+@dataclass
+class CrossRepoImport:
+    source_repo: str | None
+    target_repo: str
+    import_path: str
+    imported_names: list[str]
+    file_path: str
+    line: int
+    type: str  # 'python_module', 'monorepo_package', 'relative'
+
+
+@dataclass
+class RepoParseResult:
+    repo_id: str
+    functions: list[ParsedFunction]
+    classes: list[ParsedClass]
+    cross_repo_imports: list[CrossRepoImport]
+    errors: list[str]
+
+
+@dataclass
+class WorkspaceParseResult:
+    repo_results: list[RepoParseResult]
+    cross_repo_edges: list[dict]
+    errors: list[str]
+
+
 class UniversalParser:
     EXCLUDED_DIRS: set[str] = {
         "node_modules", "vendor", ".venv", "venv", "env", "site-packages",

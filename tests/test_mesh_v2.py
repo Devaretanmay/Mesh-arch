@@ -137,12 +137,14 @@ class TestMeshStorage:
                 node_type="call",
                 file_path="test.py",
                 data={"name": "test_func", "line": 10},
+                repo_id="test-repo",
             )
             storage.flush()
 
-            nodes = storage.get_nodes("call")
+            nodes = storage.get_nodes("call", repo_id="test-repo")
             assert len(nodes) == 1
             assert nodes[0]["id"] == "test_func"
+            assert nodes[0]["repo_id"] == "test-repo"
             storage.close()
 
 

@@ -1,6 +1,11 @@
 """
 MeshStorage — High-performance SQLite-backed graph storage.
 
+Multi-repo support:
+- Layer 1: Complete context (all repos in one graph)
+- Layer 2: Repo relationships (summary)
+- Layer 3: Per-repo details
+
 Optimizations:
 - Batch operations with transactions
 - Efficient indexes for fast queries
@@ -15,7 +20,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 from mesh.core.graph import MeshGraph
 
@@ -29,7 +34,18 @@ class StorageConfig:
     def from_root(cls, root: Path) -> "StorageConfig":
         mesh_dir = root / ".mesh"
         mesh_dir.mkdir(parents=True, exist_ok=True)
-        return cls(db_path=mesh_dir / "mesh.db", code_base_root=root)
+        db_dir = mesh_dir / "db"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        return cls(db_path=db_dir / "mesh.db", code_base_root=root)
+
+
+@dataclass
+class Repo:
+    id: str
+    name: str
+    path: str
+    type: str  # 'git' or 'submodule'
+    last_analyzed: Optional[str] = None
 
 
 class MeshStorage:
@@ -37,11 +53,14 @@ class MeshStorage:
     High-performance SQLite-backed graph storage.
     
     Schema:
-      nodes(id TEXT, type TEXT, file_path TEXT, data JSON)
-      edges(from_id TEXT, to_id TEXT, type TEXT, data JSON)
-      metadata(key TEXT, value TEXT)
-      violations(id TEXT, kind TEXT, severity TEXT, file_path TEXT, data JSON, created_at TEXT)
-      file_hashes(path TEXT PRIMARY KEY, hash TEXT, mtime REAL, size INTEGER)
+      repos(id, name, path, type, last_analyzed)
+      nodes(id, repo_id, type, file_path, data)
+      edges(from_id, to_id, from_repo, to_repo, type, data)
+      repo_relationships(source_repo, target_repo, relationship_type, count)
+      repo_details(repo_id, functions, classes, violations, metrics)
+      metadata(key, value)
+      violations(id, kind, severity, file_path, repo_id, data, created_at)
+      file_hashes(path, repo_id, hash, mtime, size)
     """
 
     def __init__(self, codebase_root: Path, batch_size: int = 1000):
@@ -65,12 +84,25 @@ class MeshStorage:
         cursor = conn.cursor()
 
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS nodes (
+            CREATE TABLE IF NOT EXISTS repos (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'git',
+                last_analyzed TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
                 type TEXT NOT NULL,
                 file_path TEXT,
                 data JSON,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id, repo_id)
             )
         """)
 
@@ -78,10 +110,34 @@ class MeshStorage:
             CREATE TABLE IF NOT EXISTS edges (
                 from_id TEXT NOT NULL,
                 to_id TEXT NOT NULL,
+                from_repo TEXT NOT NULL,
+                to_repo TEXT NOT NULL,
                 type TEXT NOT NULL,
                 data JSON,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (from_id, to_id, type)
+                PRIMARY KEY (from_id, to_id, from_repo, to_repo, type)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS repo_relationships (
+                source_repo TEXT NOT NULL,
+                target_repo TEXT NOT NULL,
+                relationship_type TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source_repo, target_repo, relationship_type)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS repo_details (
+                repo_id TEXT PRIMARY KEY,
+                functions JSON,
+                classes JSON,
+                violations JSON,
+                metrics JSON,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -99,6 +155,7 @@ class MeshStorage:
                 kind TEXT NOT NULL,
                 severity TEXT,
                 file_path TEXT,
+                repo_id TEXT,
                 data JSON,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -107,6 +164,7 @@ class MeshStorage:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS analysis_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT,
                 started_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 completed_at TEXT,
                 files_analyzed INTEGER,
@@ -119,19 +177,25 @@ class MeshStorage:
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS file_hashes (
-                path TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
                 hash TEXT NOT NULL,
                 mtime REAL,
-                size INTEGER
+                size INTEGER,
+                PRIMARY KEY (path, repo_id)
             )
         """)
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_repo ON nodes(repo_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_from_repo ON edges(from_repo)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_to_repo ON edges(to_repo)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_violations_kind ON violations(kind)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_violations_repo ON violations(repo_id)")
 
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -146,31 +210,48 @@ class MeshStorage:
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
-    def clear(self) -> None:
+    def clear(self, repo_id: str | None = None) -> None:
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM edges")
-        cursor.execute("DELETE FROM nodes")
-        cursor.execute("DELETE FROM violations")
-        cursor.execute("DELETE FROM metadata")
-        cursor.execute("DELETE FROM file_hashes")
+        
+        if repo_id:
+            cursor.execute("DELETE FROM edges WHERE from_repo = ? OR to_repo = ?", (repo_id, repo_id))
+            cursor.execute("DELETE FROM nodes WHERE repo_id = ?", (repo_id,))
+            cursor.execute("DELETE FROM violations WHERE repo_id = ?", (repo_id,))
+            cursor.execute("DELETE FROM file_hashes WHERE repo_id = ?", (repo_id,))
+            cursor.execute("DELETE FROM repo_details WHERE repo_id = ?", (repo_id,))
+        else:
+            cursor.execute("DELETE FROM edges")
+            cursor.execute("DELETE FROM nodes")
+            cursor.execute("DELETE FROM violations")
+            cursor.execute("DELETE FROM file_hashes")
+            cursor.execute("DELETE FROM repo_details")
+        
         conn.commit()
-        conn.execute("VACUUM")
 
-    def clear_by_type(self, node_type: str) -> None:
+    def clear_by_type(self, node_type: str, repo_id: str | None = None) -> None:
         conn = self._get_conn()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE type = ?)", (node_type,))
-        cursor.execute("DELETE FROM nodes WHERE type = ?", (node_type,))
+        if repo_id:
+            cursor.execute(
+                "DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE type = ? AND repo_id = ?)",
+                (node_type, repo_id)
+            )
+            cursor.execute("DELETE FROM nodes WHERE type = ? AND repo_id = ?", (node_type, repo_id))
+        else:
+            cursor.execute(
+                "DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE type = ?)",
+                (node_type,)
+            )
+            cursor.execute("DELETE FROM nodes WHERE type = ?", (node_type,))
         conn.commit()
 
-    def upsert_node(self, node_id: str, node_type: str, file_path: str, data: dict) -> None:
-        self._node_batch.append((node_id, node_type, file_path, json.dumps(data)))
+    def upsert_node(self, node_id: str, node_type: str, file_path: str, data: dict, repo_id: str) -> None:
+        self._node_batch.append((node_id, repo_id, node_type, file_path, json.dumps(data)))
         if len(self._node_batch) >= self._batch_size:
             self._flush_nodes()
 
-    def upsert_edge(self, from_id: str, to_id: str, edge_type: str, data: dict) -> None:
-        self._edge_batch.append((from_id, to_id, edge_type, json.dumps(data)))
+    def upsert_edge(self, from_id: str, to_id: str, edge_type: str, data: dict, from_repo: str, to_repo: str) -> None:
+        self._edge_batch.append((from_id, to_id, from_repo, to_repo, edge_type, json.dumps(data)))
         if len(self._edge_batch) >= self._batch_size:
             self._flush_edges()
 
@@ -179,8 +260,8 @@ class MeshStorage:
             return
         conn = self._get_conn()
         conn.executemany(
-            """INSERT INTO nodes (id, type, file_path, data) VALUES (?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET type=excluded.type, file_path=excluded.file_path, data=excluded.data""",
+            """INSERT INTO nodes (id, repo_id, type, file_path, data) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id, repo_id) DO UPDATE SET type=excluded.type, file_path=excluded.file_path, data=excluded.data""",
             self._node_batch
         )
         conn.commit()
@@ -191,8 +272,8 @@ class MeshStorage:
             return
         conn = self._get_conn()
         conn.executemany(
-            """INSERT INTO edges (from_id, to_id, type, data) VALUES (?, ?, ?, ?)
-               ON CONFLICT(from_id, to_id, type) DO UPDATE SET data=excluded.data""",
+            """INSERT INTO edges (from_id, to_id, from_repo, to_repo, type, data) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(from_id, to_id, from_repo, to_repo, type) DO UPDATE SET data=excluded.data""",
             self._edge_batch
         )
         conn.commit()
@@ -214,24 +295,24 @@ class MeshStorage:
         self._node_batch.clear()
         self._edge_batch.clear()
 
-    def upsert_node_batch(self, nodes: list[tuple[str, str, str, dict]]) -> None:
+    def upsert_node_batch(self, nodes: list[tuple[str, str, str, dict]], repo_id: str) -> None:
         conn = self._get_conn()
-        data = [(nid, ntype, fp, json.dumps(d)) for nid, ntype, fp, d in nodes]
+        data = [(nid, repo_id, ntype, fp, json.dumps(d)) for nid, ntype, fp, d in nodes]
         conn.executemany(
-            """INSERT INTO nodes (id, type, file_path, data) VALUES (?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET type=excluded.type, file_path=excluded.file_path, data=excluded.data""",
+            """INSERT INTO nodes (id, repo_id, type, file_path, data) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id, repo_id) DO UPDATE SET type=excluded.type, file_path=excluded.file_path, data=excluded.data""",
             data
         )
         conn.commit()
 
-    def upsert_edge_batch(self, edges: list[tuple[str, str, str, dict]]) -> None:
+    def upsert_edge_batch(self, edges: list[tuple[str, str, str, dict]], from_repo: str, to_repo: str) -> None:
         if not edges:
             return
         conn = self._get_conn()
-        data = [(fid, tid, etype, json.dumps(d)) for fid, tid, etype, d in edges]
+        data = [(fid, tid, from_repo, to_repo, etype, json.dumps(d)) for fid, tid, etype, d in edges]
         conn.executemany(
-            """INSERT INTO edges (from_id, to_id, type, data) VALUES (?, ?, ?, ?)
-               ON CONFLICT(from_id, to_id, type) DO UPDATE SET data=excluded.data""",
+            """INSERT INTO edges (from_id, to_id, from_repo, to_repo, type, data) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(from_id, to_id, from_repo, to_repo, type) DO UPDATE SET data=excluded.data""",
             data
         )
         conn.commit()
@@ -256,16 +337,16 @@ class MeshStorage:
         cursor = conn.execute("SELECT key, value FROM metadata")
         return {row["key"]: row["value"] for row in cursor}
 
-    def record_violation(self, violation_id: str, kind: str, severity: str, file_path: str, data: dict) -> None:
+    def record_violation(self, violation_id: str, kind: str, severity: str, file_path: str, data: dict, repo_id: str | None = None) -> None:
         conn = self._get_conn()
         conn.execute(
-            """INSERT INTO violations (id, kind, severity, file_path, data) VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, severity=excluded.severity, file_path=excluded.file_path, data=excluded.data""",
-            (violation_id, kind, severity, file_path, json.dumps(data))
+            """INSERT INTO violations (id, kind, severity, file_path, repo_id, data) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, severity=excluded.severity, file_path=excluded.file_path, repo_id=excluded.repo_id, data=excluded.data""",
+            (violation_id, kind, severity, file_path, repo_id, json.dumps(data))
         )
         conn.commit()
 
-    def get_violations(self, since: datetime | None = None, kind: str | None = None) -> list[dict]:
+    def get_violations(self, since: datetime | None = None, kind: str | None = None, repo_id: str | None = None) -> list[dict]:
         conn = self._get_conn()
         query = "SELECT * FROM violations"
         params = []
@@ -277,6 +358,9 @@ class MeshStorage:
         if kind:
             conditions.append("kind = ?")
             params.append(kind)
+        if repo_id:
+            conditions.append("repo_id = ?")
+            params.append(repo_id)
         
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -285,57 +369,72 @@ class MeshStorage:
         cursor = conn.execute(query, params)
         return [
             {"id": row["id"], "kind": row["kind"], "severity": row["severity"],
-             "file_path": row["file_path"], "data": json.loads(row["data"]) if row["data"] else {},
+             "file_path": row["file_path"], "repo_id": row["repo_id"],
+             "data": json.loads(row["data"]) if row["data"] else {},
              "created_at": row["created_at"]}
             for row in cursor
         ]
 
-    def save_file_hashes(self, hashes: list[dict]) -> None:
+    def save_file_hashes(self, hashes: list[dict], repo_id: str) -> None:
         conn = self._get_conn()
-        data = [(h["path"], h["hash"], h.get("mtime", 0), h.get("size", 0)) for h in hashes]
+        data = [(h["path"], repo_id, h["hash"], h.get("mtime", 0), h.get("size", 0)) for h in hashes]
         conn.executemany(
-            """INSERT INTO file_hashes (path, hash, mtime, size) VALUES (?, ?, ?, ?)
-               ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, mtime=excluded.mtime, size=excluded.size""",
+            """INSERT INTO file_hashes (path, repo_id, hash, mtime, size) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(path, repo_id) DO UPDATE SET hash=excluded.hash, mtime=excluded.mtime, size=excluded.size""",
             data
         )
         conn.commit()
 
-    def get_file_hash(self, path: str) -> str | None:
+    def get_file_hash(self, path: str, repo_id: str) -> str | None:
         conn = self._get_conn()
-        cursor = conn.execute("SELECT hash FROM file_hashes WHERE path = ?", (path,))
+        cursor = conn.execute("SELECT hash FROM file_hashes WHERE path = ? AND repo_id = ?", (path, repo_id))
         row = cursor.fetchone()
         return row["hash"] if row else None
 
-    def get_all_file_hashes(self) -> dict[str, str]:
+    def get_all_file_hashes(self, repo_id: str | None = None) -> dict[str, str]:
         conn = self._get_conn()
-        cursor = conn.execute("SELECT path, hash FROM file_hashes")
+        if repo_id:
+            cursor = conn.execute("SELECT path, hash FROM file_hashes WHERE repo_id = ?", (repo_id,))
+        else:
+            cursor = conn.execute("SELECT path, hash FROM file_hashes")
         return {row["path"]: row["hash"] for row in cursor}
 
-    def graphs_exist(self) -> bool:
+    def graphs_exist(self, repo_id: str | None = None) -> bool:
         conn = self._get_conn()
-        cursor = conn.execute("SELECT COUNT(*) as count FROM nodes")
+        if repo_id:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM nodes WHERE repo_id = ?", (repo_id,))
+        else:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM nodes")
         row = cursor.fetchone()
         return row["count"] > 0 if row else False
 
-    def node_count(self, node_type: str | None = None) -> int:
+    def node_count(self, node_type: str | None = None, repo_id: str | None = None) -> int:
         conn = self._get_conn()
-        if node_type:
+        if node_type and repo_id:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM nodes WHERE type = ? AND repo_id = ?", (node_type, repo_id))
+        elif node_type:
             cursor = conn.execute("SELECT COUNT(*) as count FROM nodes WHERE type = ?", (node_type,))
+        elif repo_id:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM nodes WHERE repo_id = ?", (repo_id,))
         else:
             cursor = conn.execute("SELECT COUNT(*) as count FROM nodes")
         row = cursor.fetchone()
         return row["count"] if row else 0
 
-    def edge_count(self, edge_type: str | None = None) -> int:
+    def edge_count(self, edge_type: str | None = None, repo_id: str | None = None) -> int:
         conn = self._get_conn()
-        if edge_type:
+        if edge_type and repo_id:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM edges WHERE type = ? AND (from_repo = ? OR to_repo = ?)", (edge_type, repo_id, repo_id))
+        elif edge_type:
             cursor = conn.execute("SELECT COUNT(*) as count FROM edges WHERE type = ?", (edge_type,))
+        elif repo_id:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM edges WHERE from_repo = ? OR to_repo = ?", (repo_id, repo_id))
         else:
             cursor = conn.execute("SELECT COUNT(*) as count FROM edges")
         row = cursor.fetchone()
         return row["count"] if row else 0
 
-    def get_nodes(self, node_type: str | None = None, file_path: str | None = None) -> list[dict]:
+    def get_nodes(self, node_type: str | None = None, file_path: str | None = None, repo_id: str | None = None) -> list[dict]:
         conn = self._get_conn()
         query = "SELECT * FROM nodes"
         params = []
@@ -347,18 +446,21 @@ class MeshStorage:
         if file_path:
             conditions.append("file_path LIKE ?")
             params.append(f"%{file_path}%")
+        if repo_id:
+            conditions.append("repo_id = ?")
+            params.append(repo_id)
         
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         
         cursor = conn.execute(query, params)
         return [
-            {"id": row["id"], "type": row["type"], "file_path": row["file_path"],
+            {"id": row["id"], "repo_id": row["repo_id"], "type": row["type"], "file_path": row["file_path"],
              "data": json.loads(row["data"]) if row["data"] else {}}
             for row in cursor
         ]
 
-    def get_edges(self, edge_type: str | None = None, from_id: str | None = None) -> list[dict]:
+    def get_edges(self, edge_type: str | None = None, from_id: str | None = None, repo_id: str | None = None) -> list[dict]:
         conn = self._get_conn()
         query = "SELECT * FROM edges"
         params = []
@@ -370,25 +472,37 @@ class MeshStorage:
         if from_id:
             conditions.append("from_id = ?")
             params.append(from_id)
+        if repo_id:
+            conditions.append("(from_repo = ? OR to_repo = ?)")
+            params.append(repo_id)
+            params.append(repo_id)
         
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         
         cursor = conn.execute(query, params)
         return [
-            {"from_id": row["from_id"], "to_id": row["to_id"], "type": row["type"],
+            {"from_id": row["from_id"], "to_id": row["to_id"], "from_repo": row["from_repo"],
+             "to_repo": row["to_repo"], "type": row["type"],
              "data": json.loads(row["data"]) if row["data"] else {}}
             for row in cursor
         ]
 
-    def iter_nodes(self, node_type: str | None = None, batch_size: int = 1000) -> Iterator[dict]:
+    def iter_nodes(self, node_type: str | None = None, repo_id: str | None = None, batch_size: int = 1000) -> Iterator[dict]:
         conn = self._get_conn()
         query = "SELECT * FROM nodes"
         params = []
         
+        conditions = []
         if node_type:
-            query += " WHERE type = ?"
+            conditions.append("type = ?")
             params.append(node_type)
+        if repo_id:
+            conditions.append("repo_id = ?")
+            params.append(repo_id)
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         
         cursor = conn.execute(query, params)
         while True:
@@ -396,18 +510,19 @@ class MeshStorage:
             if not rows:
                 break
             for row in rows:
-                yield {"id": row["id"], "type": row["type"], "file_path": row["file_path"],
+                yield {"id": row["id"], "repo_id": row["repo_id"], "type": row["type"], "file_path": row["file_path"],
                        "data": json.loads(row["data"]) if row["data"] else {}}
 
-    def load_call_graph(self) -> MeshGraph:
+    def load_call_graph(self, repo_id: str | None = None) -> MeshGraph:
         graph = MeshGraph("call")
-        for node in self.iter_nodes("call"):
+        for node in self.iter_nodes("call", repo_id):
             node_id = node["id"]
             if node_id.startswith("call:"):
                 node_id = node_id[5:]
+            node["data"]["repo_id"] = node["repo_id"]
             graph.add_node(node_id, node["data"])
 
-        for edge in self.get_edges():
+        for edge in self.get_edges("call", repo_id=repo_id):
             from_id = edge["from_id"]
             to_id = edge["to_id"]
             if from_id.startswith("call:"):
@@ -418,15 +533,16 @@ class MeshStorage:
 
         return graph
 
-    def load_data_flow_graph(self) -> MeshGraph:
+    def load_data_flow_graph(self, repo_id: str | None = None) -> MeshGraph:
         graph = MeshGraph("dataflow")
-        for node in self.iter_nodes("dataflow"):
+        for node in self.iter_nodes("dataflow", repo_id):
             node_id = node["id"]
             if node_id.startswith("dataflow:"):
                 node_id = node_id[9:]
+            node["data"]["repo_id"] = node["repo_id"]
             graph.add_node(node_id, node["data"])
 
-        for edge in self.get_edges("dataflow"):
+        for edge in self.get_edges("dataflow", repo_id=repo_id):
             from_id = edge["from_id"]
             to_id = edge["to_id"]
             if from_id.startswith("dataflow:"):
@@ -437,15 +553,16 @@ class MeshStorage:
 
         return graph
 
-    def load_type_deps_graph(self) -> MeshGraph:
+    def load_type_deps_graph(self, repo_id: str | None = None) -> MeshGraph:
         graph = MeshGraph("type")
-        for node in self.iter_nodes("type"):
+        for node in self.iter_nodes("type", repo_id):
             node_id = node["id"]
             if node_id.startswith("type:"):
                 node_id = node_id[5:]
+            node["data"]["repo_id"] = node["repo_id"]
             graph.add_node(node_id, node["data"])
 
-        for edge in self.get_edges("type"):
+        for edge in self.get_edges("type", repo_id=repo_id):
             from_id = edge["from_id"]
             to_id = edge["to_id"]
             if from_id.startswith("type:"):
@@ -455,6 +572,139 @@ class MeshStorage:
             graph.add_edge(from_id, to_id, edge.get("data", {}))
 
         return graph
+
+    def get_cross_repo_edges(self) -> list[dict]:
+        conn = self._get_conn()
+        cursor = conn.execute("""
+            SELECT * FROM edges 
+            WHERE from_repo != to_repo
+            ORDER BY from_repo, to_repo
+        """)
+        return [
+            {"from_id": row["from_id"], "to_id": row["to_id"], "from_repo": row["from_repo"],
+             "to_repo": row["to_repo"], "type": row["type"],
+             "data": json.loads(row["data"]) if row["data"] else {}}
+            for row in cursor
+        ]
+
+    def save_repo(self, repo: Repo) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO repos (id, name, path, type, last_analyzed) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, path=excluded.path, type=excluded.type, last_analyzed=excluded.last_analyzed""",
+            (repo.id, repo.name, repo.path, repo.type, repo.last_analyzed)
+        )
+        conn.commit()
+
+    def get_repos(self) -> list[Repo]:
+        conn = self._get_conn()
+        cursor = conn.execute("SELECT * FROM repos ORDER BY name")
+        return [
+            Repo(id=row["id"], name=row["name"], path=row["path"], type=row["type"], last_analyzed=row["last_analyzed"])
+            for row in cursor
+        ]
+
+    def get_repo(self, repo_id: str) -> Repo | None:
+        conn = self._get_conn()
+        cursor = conn.execute("SELECT * FROM repos WHERE id = ?", (repo_id,))
+        row = cursor.fetchone()
+        if row:
+            return Repo(id=row["id"], name=row["name"], path=row["path"], type=row["type"], last_analyzed=row["last_analyzed"])
+        return None
+
+    def delete_repo(self, repo_id: str) -> None:
+        conn = self._get_conn()
+        self.clear(repo_id)
+        conn.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        conn.execute("DELETE FROM repo_details WHERE repo_id = ?", (repo_id,))
+        conn.commit()
+
+    def update_repo_analysis_time(self, repo_id: str) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE repos SET last_analyzed = ? WHERE id = ?", (datetime.utcnow().isoformat(), repo_id))
+        conn.commit()
+
+    def save_repo_relationships(self, relationships: list[dict]) -> None:
+        conn = self._get_conn()
+        data = [(r["source_repo"], r["target_repo"], r["relationship_type"], r.get("count", 0)) for r in relationships]
+        conn.executemany(
+            """INSERT INTO repo_relationships (source_repo, target_repo, relationship_type, count) VALUES (?, ?, ?, ?)
+               ON CONFLICT(source_repo, target_repo, relationship_type) DO UPDATE SET count=excluded.count""",
+            data
+        )
+        conn.commit()
+
+    def get_repo_relationships(self, repo_id: str | None = None) -> list[dict]:
+        conn = self._get_conn()
+        if repo_id:
+            cursor = conn.execute(
+                """SELECT * FROM repo_relationships 
+                   WHERE source_repo = ? OR target_repo = ?
+                   ORDER BY source_repo, target_repo""",
+                (repo_id, repo_id)
+            )
+        else:
+            cursor = conn.execute("SELECT * FROM repo_relationships ORDER BY source_repo, target_repo")
+        return [
+            {"source_repo": row["source_repo"], "target_repo": row["target_repo"],
+             "relationship_type": row["relationship_type"], "count": row["count"]}
+            for row in cursor
+        ]
+
+    def get_repo_matrix(self) -> dict:
+        conn = self._get_conn()
+        cursor = conn.execute("SELECT DISTINCT source_repo, target_repo FROM repo_relationships")
+        matrix = {}
+        for row in cursor:
+            src = row["source_repo"]
+            tgt = row["target_repo"]
+            if src not in matrix:
+                matrix[src] = {"depends_on": [], "depended_on_by": []}
+            if tgt not in matrix:
+                matrix[tgt] = {"depends_on": [], "depended_on_by": []}
+            matrix[src]["depends_on"].append(tgt)
+            matrix[tgt]["depended_on_by"].append(src)
+        return matrix
+
+    def save_repo_detail(self, repo_id: str, functions: list, classes: list, violations: list, metrics: dict) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO repo_details (repo_id, functions, classes, violations, metrics, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(repo_id) DO UPDATE SET functions=excluded.functions, classes=excluded.classes, 
+               violations=excluded.violations, metrics=excluded.metrics, updated_at=CURRENT_TIMESTAMP""",
+            (repo_id, json.dumps(functions), json.dumps(classes), json.dumps(violations), json.dumps(metrics))
+        )
+        conn.commit()
+
+    def get_repo_detail(self, repo_id: str) -> dict | None:
+        conn = self._get_conn()
+        cursor = conn.execute("SELECT * FROM repo_details WHERE repo_id = ?", (repo_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                "repo_id": row["repo_id"],
+                "functions": json.loads(row["functions"]) if row["functions"] else [],
+                "classes": json.loads(row["classes"]) if row["classes"] else [],
+                "violations": json.loads(row["violations"]) if row["violations"] else [],
+                "metrics": json.loads(row["metrics"]) if row["metrics"] else {},
+                "updated_at": row["updated_at"]
+            }
+        return None
+
+    def get_all_repo_details(self) -> list[dict]:
+        conn = self._get_conn()
+        cursor = conn.execute("SELECT * FROM repo_details ORDER BY repo_id")
+        results = []
+        for row in cursor:
+            results.append({
+                "repo_id": row["repo_id"],
+                "functions": json.loads(row["functions"]) if row["functions"] else [],
+                "classes": json.loads(row["classes"]) if row["classes"] else [],
+                "violations": json.loads(row["violations"]) if row["violations"] else [],
+                "metrics": json.loads(row["metrics"]) if row["metrics"] else {},
+                "updated_at": row["updated_at"]
+            })
+        return results
 
     def close(self) -> None:
         self.flush()
