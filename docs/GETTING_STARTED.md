@@ -1,6 +1,6 @@
 # Getting Started with Mesh v2.0
 
-Mesh is an architectural coherence layer for AI-generated codebases. It analyzes your code, builds dependency graphs, and helps maintain architectural integrity.
+Mesh is an architectural coherence layer for AI-generated codebases. It analyzes your code, builds dependency graphs, and helps maintain architectural integrity across single repos or multi-repo workspaces.
 
 ## Quick Start
 
@@ -17,7 +17,14 @@ cd your-project
 mesh init
 ```
 
-This scans your codebase and builds dependency graphs. First run analyzes all files; subsequent runs are incremental.
+For multi-repo workspaces (detects all git repos automatically):
+
+```bash
+cd /path/to/workspace
+mesh init
+```
+
+This scans your codebase and builds dependency graphs. First run analyzes all files.
 
 ### 3. Check Your Code
 
@@ -33,25 +40,63 @@ Detects architectural violations like circular dependencies, duplicate function 
 
 | Command | Description |
 |---------|-------------|
-| `mesh init` | Analyze codebase and build graphs |
-| `mesh status` | Show analysis stats and auth status |
+| `mesh init` | Analyze codebase(s) and build graphs |
+| `mesh init --repo <name>` | Analyze specific repo only |
+| `mesh status` | Show analysis stats |
+| `mesh repos` | Show all repos and dependencies |
+| `mesh context` | Show complete cross-repo graph |
+| `mesh context --repo <name>` | Focus on specific repo |
 | `mesh check` | Detect architectural violations |
 | `mesh doctor` | Full system health check |
-| `mesh ask "question"` | Query your codebase (Pro) |
+| `mesh ask "question"` | Query your codebase with AI |
 
 ---
 
-## Authentication & Tiers
+## Multi-Repo Support
 
-Mesh has three tiers:
+Mesh automatically detects git repositories in your workspace:
 
-| Tier | Price | Features |
-|------|-------|----------|
-| **Free** | $0 | Code analysis, violation checking |
-| **Personal Pro** | $5/mo | AI queries, summaries |
-| **Organization Pro** | $10/mo | Team features, admin controls |
+```bash
+# Analyze all repos
+mesh init
 
-### Logging In
+# Analyze specific repo
+mesh init --repo backend
+
+# View repo relationships
+mesh repos
+
+# See cross-repo dependencies
+mesh context
+```
+
+### How It Works
+
+1. **Detection**: Scans for folders with `.git` directories
+2. **Analysis**: Analyzes each repo independently
+3. **Cross-repo Detection**: Maps imports between repos
+4. **Relationship Matrix**: Builds dependency graph across repos
+
+Example output:
+```
+Repositories in Workspace
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Name                   ┃ Type ┃ Functions ┃ Classes ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━┩
+│ backend                │ git  │       234 │      45 │
+│ frontend               │ git  │       156 │      28 │
+└────────────────────────┴──────┴───────────┴─────────┘
+
+Dependencies:
+  backend depends on: shared-lib
+  frontend depends on: backend, shared-lib
+```
+
+---
+
+## Authentication
+
+Login is optional but unlocks Pro features:
 
 ```bash
 mesh login
@@ -59,10 +104,7 @@ mesh login
 
 Enter your GitHub Personal Access Token when prompted. Get one at: https://github.com/settings/tokens (scope: `read:user`)
 
-Mesh automatically detects:
-- No login → Free tier
-- Personal GitHub → Personal Pro
-- Organization GitHub → must upgrade to Org Pro
+**All features are free** - login just marks you as a Pro user.
 
 ---
 
@@ -77,6 +119,11 @@ Mesh parses 26+ languages using ast-grep:
 - **Type Graph**: Class and interface relationships
 - **Data Flow Graph**: How data moves through your codebase
 
+### Multi-Repo Analysis
+- Automatic repo detection
+- Cross-repo import mapping
+- Dependency matrix between repos
+
 ### Violation Detection
 - Circular dependencies
 - Duplicate function names
@@ -85,7 +132,7 @@ Mesh parses 26+ languages using ast-grep:
 
 ---
 
-## Optional: AI-Powered Queries
+## AI-Powered Queries
 
 To use `mesh ask`, download the local LLM:
 
@@ -94,6 +141,14 @@ mesh download-model
 ```
 
 This downloads Qwen2.5-Coder-1.5B (~1GB). All inference runs locally on your machine.
+
+```bash
+# Query across all repos
+mesh ask "how does authentication work?"
+
+# Query specific repo
+mesh ask "auth in backend" --repo backend
+```
 
 ---
 
@@ -115,8 +170,6 @@ Start the MCP server for AI assistant integration (Cursor, Claude Code):
 mesh serve
 ```
 
-Requires Pro tier.
-
 ---
 
 ## Troubleshooting
@@ -127,7 +180,7 @@ pip install mesh-arch
 ```
 
 ### Analysis is slow on large codebases
-Mesh uses incremental analysis. Run `mesh init` once, then `mesh check` for subsequent runs.
+Mesh uses optimized parallel parsing. For multi-repo, use `--repo` to analyze specific repos.
 
 ### Model download fails
 ```bash
