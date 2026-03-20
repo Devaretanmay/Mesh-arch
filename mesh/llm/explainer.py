@@ -39,9 +39,18 @@ class CodeExplainer:
         call_graph = context.get("call_graph", "")
         files = context.get("files", [])
         violations = context.get("violations", [])
+        repos = context.get("repos", [])
+        cross_repo_deps = context.get("cross_repo_dependencies", "")
 
         prompt_parts = []
-        
+
+        if repos:
+            repo_list = ", ".join(r.get("name", r.get("id", "")) for r in repos)
+            prompt_parts.append(f"Repositories in workspace:\n{repo_list}")
+
+        if cross_repo_deps:
+            prompt_parts.append(cross_repo_deps)
+
         if files:
             file_list = "\n".join(f"- {f}" for f in files[:20])
             prompt_parts.append(f"Key files in codebase:\n{file_list}")
@@ -114,19 +123,86 @@ Provide a brief architectural summary of the codebase.""",
             self._llm = None
 
 
-def explain_query(query: str, root_path: Path) -> str:
+def explain_query(query: str, root_path: Path, repo_id: str | None = None) -> str:
     from mesh.analysis.builder import AnalysisBuilder
+    from mesh.analysis.workspace import WorkspaceAnalysisBuilder
+    from mesh.core.workspace import get_workspace
 
-    storage = MeshStorage(root_path)
+    workspace = get_workspace(root_path)
+    is_workspace = len(workspace.repos) > 1
 
-    if not storage.graphs_exist():
-        storage.close()
-        builder = AnalysisBuilder(root_path)
-        builder.run_full_analysis()
+    if is_workspace:
+        builder = WorkspaceAnalysisBuilder(root_path)
+        repos = builder.storage.get_repos()
+        
+        if not repos:
+            builder.detect_and_register_repos()
+            for repo in workspace.repos:
+                builder.analyze_repo(repo)
+        
+        context = _build_workspace_context(builder, repo_id)
         builder.close()
+    else:
         storage = MeshStorage(root_path)
 
-    nodes = storage.get_nodes()
+        if not storage.graphs_exist():
+            storage.close()
+            builder = AnalysisBuilder(root_path)
+            builder.run_full_analysis()
+            builder.close()
+            storage = MeshStorage(root_path)
+
+        context = _build_single_repo_context(storage, repo_id)
+        storage.close()
+
+    explainer = CodeExplainer()
+    try:
+        return explainer.explain(query, context)
+    finally:
+        explainer.unload()
+
+
+def _build_workspace_context(builder: WorkspaceAnalysisBuilder, focus_repo: str | None = None) -> dict:
+    workspace = builder.workspace
+    repos = builder.storage.get_repos()
+    
+    context = {
+        "repos": [
+            {"id": r.id, "name": r.name, "type": r.type}
+            for r in repos
+        ],
+        "files": [],
+        "functions": [],
+        "call_graph": "",
+        "cross_repo_dependencies": "",
+        "violations": [],
+    }
+    
+    for repo in repos:
+        if focus_repo and repo.id != focus_repo:
+            continue
+        
+        detail = builder.get_repo_detail(repo.id)
+        if detail:
+            for func in detail.get("functions", [])[:20]:
+                context["functions"].append(f"{repo.name}::{func.get('name', '')}")
+            
+            for cls in detail.get("classes", [])[:10]:
+                context["functions"].append(f"{repo.name}::class::{cls.get('name', '')}")
+    
+    matrix = builder.get_repo_relationships()
+    if matrix:
+        lines = ["Repository dependencies:"]
+        for repo_id, deps in matrix.items():
+            if deps.get("depends_on"):
+                lines.append(f"  {repo_id} depends on: {', '.join(deps['depends_on'])}")
+        context["cross_repo_dependencies"] = "\n".join(lines)
+    
+    return context
+
+
+def _build_single_repo_context(storage: MeshStorage, repo_id: str | None = None) -> dict:
+    nodes = storage.get_nodes(repo_id=repo_id)
     
     files: dict[str, int] = {}
     for n in nodes:
@@ -136,33 +212,38 @@ def explain_query(query: str, root_path: Path) -> str:
     context = {
         "files": list(files.keys()),
         "functions": [n.get("name", "") for n in nodes],
-        "call_graph": _build_call_graph_summary(storage),
+        "call_graph": _build_call_graph_summary(storage, repo_id),
         "violations": [],
     }
-    storage.close()
-
-    explainer = CodeExplainer()
-    try:
-        return explainer.explain(query, context)
-    finally:
-        explainer.unload()
+    
+    return context
 
 
-def _build_call_graph_summary(storage: MeshStorage) -> str:
-    edges = storage.get_edges()
+def _build_call_graph_summary(storage: MeshStorage, repo_id: str | None = None) -> str:
+    edges = storage.get_edges(repo_id=repo_id)
     if not edges:
         return "No call dependencies found."
 
-    calls = [e for e in edges if e.get("edge_type") == "calls"]
-    if not calls:
-        return "No function calls detected."
+    cross_repo = [e for e in edges if e.get("from_repo") != e.get("to_repo")]
+    same_repo = [e for e in edges if e.get("from_repo") == e.get("to_repo")]
 
-    top_calls = sorted(calls, key=lambda x: x.get("count", 0), reverse=True)[:15]
-    lines = ["Key call relationships:"]
-    for edge in top_calls:
-        caller = edge.get("from_node", "")
-        callee = edge.get("to_node", "")
-        if caller and callee:
-            lines.append(f"  {caller} → {callee}")
+    lines = []
+
+    if cross_repo:
+        lines.append("Cross-repo dependencies:")
+        for edge in cross_repo[:10]:
+            lines.append(f"  {edge.get('from_repo')} → {edge.get('to_repo')}: {edge.get('type', 'calls')}")
+
+    calls = [e for e in same_repo if e.get("type") == "calls"]
+    if calls:
+        lines.append("\nKey call relationships:")
+        for edge in calls[:15]:
+            caller = edge.get("from_id", "")
+            callee = edge.get("to_id", "")
+            if caller and callee:
+                lines.append(f"  {caller} → {callee}")
+
+    if not lines:
+        return "No function calls detected."
 
     return "\n".join(lines)

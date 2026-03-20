@@ -322,7 +322,8 @@ def setup():
 @cli.command()
 @click.argument("question")
 @click.option("--root", default=".", help="Codebase root")
-def ask(question, root):
+@click.option("--repo", help="Specific repo to query (for workspaces)")
+def ask(question, root, repo):
     """Ask a natural language question about your codebase.
 
     Examples:
@@ -333,15 +334,24 @@ def ask(question, root):
 
       mesh ask "how do the verification flows differ?"
 
+      mesh ask "auth in adminv3" --repo adminv3
+
     Requires: Download the model first with 'mesh download-model'
     """
     from mesh.llm.explainer import explain_query
+    from mesh.llm import is_model_downloaded
+
+    if not is_model_downloaded():
+        console.print("")
+        console.print("  [yellow]Model not downloaded.[/yellow]")
+        console.print("  Run 'mesh download-model' first.")
+        return
 
     root_path = Path(root).resolve()
 
     console.print(f"\n[dim]Analysing: {question}[/dim]")
 
-    answer = explain_query(question, root_path)
+    answer = explain_query(question, root_path, repo_id=repo)
 
     console.print(answer)
     console.print()
