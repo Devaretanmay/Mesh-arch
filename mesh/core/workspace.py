@@ -135,6 +135,17 @@ def detect_workspace(root: Path) -> WorkspaceInfo:
     
     workspace.repos = detect_repos(root)
     
+    if not workspace.repos:
+        is_root_repo, root_type = detect_git_repo(root)
+        if is_root_repo:
+            root_repo = RepoInfo(
+                id=root.name or "root",
+                name=root.name or "root",
+                path=root,
+                type=root_type,
+            )
+            workspace.repos = [root_repo]
+    
     return workspace
 
 
